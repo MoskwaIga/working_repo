@@ -1,23 +1,50 @@
 from typing import Dict, List, Any
 
-def validate_dynamic_balance_sheet(data: Dict[str, float]) -> List[Dict[str, Any]]:
+def normalize_and_flatten(data: Any, parent_key: str = '') -> Dict[str, float]:
     """
-    Dynamicznie wykrywa strukturę bilansu ze słownika danych i waliduje sumy kontrolne.
-    Obsługuje dowolny zakres sekcji głównych (np. AKTYWA_A do AKTYWA_I) 
-    oraz podpozycji rzymskich (np. PASYWA_A_I do PASYWA_A_IX).
-    
-    Tolerancja błędu: max 1% wyższej z porównywanych wartości.
+    Automatycznie przekształca zagnieżdżone słowniki na płaską strukturę, 
+    konwertuje klucze na WIELKIE LITERY i zamienia wartości na float.
     """
+    items = {}
+    if isinstance(data, dict):
+        for k, v in data.items():
+            clean_k = str(k).upper().strip()
+            # Wyciąganie nazwy bez ewentualnych prefiksów XML (np. 'ns:AKTYWA' -> 'AKTYWA')
+            if ":" in clean_k:
+                clean_k = clean_k.split(":")[-1]
+                
+            new_key = f"{parent_key}_{clean_k}" if parent_key else clean_k
+            
+            if isinstance(v, dict):
+                items.update(normalize_and_flatten(v, new_key))
+            else:
+                try:
+                    if v is not None:
+                        items[new_key] = float(v)
+                except (ValueError, TypeError):
+                    pass
+    return items
+
+def validate_dynamic_balance_sheet(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    # 1. Normalizacja danych wejściowych
+    data = normalize_and_flatten(raw_data)
     results = []
 
+    # Szukanie głównych węzłów korzenia (obsługuje 'AKTYWA', 'AKTYWA_RAZEM' itp.)
+    root_aktywa = next((k for k in data.keys() if k in ["AKTYWA", "AKTYWA_RAZEM"]), None)
+    root_pasywa = next((k for k in data.keys() if k in ["PASYWA", "PASYWA_RAZEM"]), None)
+
+    if not root_aktywa and not root_pasywa:
+        print("UWAGA: Nie znaleziono kluczy AKTYWA / PASYWA w słowniku. Dostępne klucze:", list(data.keys())[:10])
+        return []
+
     def get_direct_children(parent_key: str) -> List[str]:
-        """Znajduje bezpośrednie pozycje podrzędne (dzieci) dla wskazanego węzła."""
         prefix = parent_key + "_"
         children = []
         for key in data.keys():
             if key.startswith(prefix):
                 suffix = key[len(prefix):]
-                # Dziecko bezpośrednie nie zawiera kolejnych separatorów '_'
+                # Szukamy bezpośrednich dzieci (brak kolejnego separatora '_')
                 if "_" not in suffix:
                     children.append(key)
         return sorted(children)
@@ -31,7 +58,6 @@ def validate_dynamic_balance_sheet(data: Dict[str, float]) -> List[Dict[str, Any
         diff = abs(parent_val - children_val)
         max_val = max(abs(parent_val), abs(children_val))
 
-        # Warunek 1% wyższej wartości: diff <= 0.01 * max(parent, sum_children)
         tolerance = 0.01 * max_val if max_val > 0 else 0.0
         passed = diff <= tolerance
         rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
@@ -47,30 +73,25 @@ def validate_dynamic_balance_sheet(data: Dict[str, float]) -> List[Dict[str, Any
             "status": "PASS" if passed else "FAIL"
         })
 
-    # --- POZIOM 0: AKTYWA == PASYWA ---
-    if "AKTYWA" in data and "PASYWA" in data:
-        check_parent_children("AKTYWA", ["PASYWA"], "Poziom 0: Aktywa == Pasywa")
+    # --- POZIOM 0 ---
+    if root_aktywa and root_pasywa:
+        check_parent_children(root_aktywa, [root_pasywa], "Poziom 0: Aktywa == Pasywa")
 
-    # --- POZIOM 1: AKTYWA / PASYWA = suma bezpośrednich grup (np. A, B, C... I) ---
-    for main_key in ["AKTYWA", "PASYWA"]:
-        if main_key in data:
-            children = get_direct_children(main_key)
+    # --- POZIOM 1 ---
+    for root in [root_aktywa, root_pasywa]:
+        if root:
+            children = get_direct_children(root)
             if children:
-                check_parent_children(
-                    main_key, 
-                    children, 
-                    f"Poziom 1: {main_key} = sum({', '.join(children)})"
-                )
+                check_parent_children(root, children, f"Poziom 1: {root} = suma dzieci")
 
-    # --- POZIOM 2: Grupy główne = suma podpozycji (np. A_I, A_II... A_IX) ---
-    level1_keys = get_direct_children("AKTYWA") + get_direct_children("PASYWA")
+    # --- POZIOM 2 ---
+    level1_keys = []
+    if root_aktywa: level1_keys.extend(get_direct_children(root_aktywa))
+    if root_pasywa: level1_keys.extend(get_direct_children(root_pasywa))
+
     for lvl1_key in level1_keys:
         children = get_direct_children(lvl1_key)
         if children:
-            check_parent_children(
-                lvl1_key, 
-                children, 
-                f"Poziom 2: {lvl1_key} = sum({', '.join(children)})"
-            )
+            check_parent_children(lvl1_key, children, f"Poziom 2: {lvl1_key} = suma dzieci")
 
     return results
