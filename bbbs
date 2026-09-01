@@ -4,16 +4,19 @@ import pandas as pd
 def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Waliduje sumy kontrolne bilansu w DataFrame do 2 poziomów w dół.
-    Automatycznie filtruje kolumny techniczne (KRS, daty), analizując wyłącznie 
-    kolumny rozpoczynające się od 'Aktywa_' lub 'Pasywa_'.
+    
+    Uwzględnia:
+    - Kolumnę 'report_period_end_dte' w tabeli wynikowej.
+    - Automatyczny status 'PASS', jeśli spółka nie raportuje podpozycji (wszystkie dzieci = 0.0).
+    - Tolerancję odchylenia do 1% wyższej wartości.
     """
     results = []
 
-    # Wybieramy tylko kolumny z danymi bilansowymi
+    # Wybór kolumn z danymi bilansowymi
     balance_cols = [c for c in df.columns if re.match(r'^(Aktywa|Pasywa)_', str(c), re.IGNORECASE)]
 
     for row_idx, row in df.iterrows():
-        # Budujemy słownik czystych wartości liczbowych dla danego wiersza
+        # Zasilanie słownika czystymi wartościami liczbowymi
         data = {}
         for col in balance_cols:
             val = row[col]
@@ -22,8 +25,10 @@ def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
             except (ValueError, TypeError):
                 data[str(col)] = 0.0
 
-        # Identyfikator sprawozdania (używa KRS/id z tabeli lub indeksu wiersza)
+        # Identyfikator podmiotu i data okresu
         row_id = row.get('krs', row.get('KRS', row_idx))
+        period_end_dte = row.get('report_period_end_dte', None)
+
         periods = ["current", "previous"]
 
         def check_sum(parent_key: str, child_keys: list, label: str):
@@ -31,18 +36,29 @@ def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
                 return
 
             parent_val = data.get(parent_key, 0.0)
-            children_val = sum(data.get(k, 0.0) for k in child_keys)
+            children_vals = [data.get(k, 0.0) for k in child_keys]
+            children_val = sum(children_vals)
+            
+            # Warunek braku raportowania: wszystkie dzieci mają wartość 0.0
+            all_children_zero = all(v == 0.0 for v in children_vals)
+
             diff = abs(parent_val - children_val)
             max_val = max(abs(parent_val), abs(children_val))
 
-            # Progowanie tolerancji: max 1% wyższej wartości
             tolerance = 0.01 * max_val if max_val > 0 else 0.0
-            passed = diff <= tolerance
+            
+            # Jeśli brak raportowania uszczegółowienia (sam zeros) -> zaliczamy jako PASS
+            if all_children_zero:
+                passed = True
+            else:
+                passed = diff <= tolerance
+
             rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
 
             results.append({
                 "row_id": row_id,
-                "okres": label.split()[0],
+                "report_period_end_dte": period_end_dte,
+                "analizowany_okres": label.split()[0],
                 "relacja": label,
                 "rodzic": parent_key,
                 "wartosc_rodzica": parent_val,
