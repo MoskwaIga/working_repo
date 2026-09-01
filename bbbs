@@ -1,36 +1,72 @@
 import re
 import pandas as pd
 
+def safe_float(val) -> float:
+    """Konwertuje liczby, w tym formaty księgowe '(100)' na -100.0."""
+    if pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    
+    val_str = str(val).strip()
+    if val_str.startswith('(') and val_str.endswith(')'):
+        val_str = '-' + val_str[1:-1]
+        
+    try:
+        return float(val_str.replace(' ', '').replace(',', '.'))
+    except (ValueError, TypeError):
+        return 0.0
+
+def is_forbidden_negative(key: str) -> bool:
+    """
+    Sprawdza, czy dana pozycja bilansowa ma bezwzględny zakaz wartości ujemnych.
+    """
+    # Usunięcie sufiksu okresu (_current / _previous)
+    base_key = re.sub(r'_(current|previous)$', '', key, flags=re.IGNORECASE)
+    
+    # 1. Wszystkie Aktywa muszą być >= 0
+    if base_key.startswith('Aktywa'):
+        return True
+        
+    # 2. Pasywa Razem, Zobowiązania (Pasywa_B i dzieci) oraz Kapitał Podstawowy (Pasywa_A_I)
+    if base_key in ['Pasywa', 'Pasywa_B', 'Pasywa_A_I'] or base_key.startswith('Pasywa_B_'):
+        return True
+        
+    return False
+
 def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Waliduje sumy kontrolne bilansu w DataFrame do 2 poziomów w dół.
-    
-    Uwzględnia:
-    - Kolumnę 'report_period_end_dte' w tabeli wynikowej.
-    - Automatyczny status 'PASS', jeśli spółka nie raportuje podpozycji (wszystkie dzieci = 0.0).
-    - Tolerancję odchylenia do 1% wyższej wartości.
+    Waliduje sumy kontrolne oraz występowanie niedozwolonych wartości ujemnych.
     """
     results = []
-
-    # Wybór kolumn z danymi bilansowymi
     balance_cols = [c for c in df.columns if re.match(r'^(Aktywa|Pasywa)_', str(c), re.IGNORECASE)]
 
     for row_idx, row in df.iterrows():
-        # Zasilanie słownika czystymi wartościami liczbowymi
-        data = {}
-        for col in balance_cols:
-            val = row[col]
-            try:
-                data[str(col)] = float(val) if pd.notna(val) else 0.0
-            except (ValueError, TypeError):
-                data[str(col)] = 0.0
-
-        # Identyfikator podmiotu i data okresu
+        data = {str(col): safe_float(row[col]) for col in balance_cols}
         row_id = row.get('krs', row.get('KRS', row_idx))
         period_end_dte = row.get('report_period_end_dte', None)
 
         periods = ["current", "previous"]
 
+        # --- TEST 1: Walidacja wartości ujemnych ---
+        for col_key, val in data.items():
+            if val < 0 and is_forbidden_negative(col_key):
+                period = "current" if col_key.lower().endswith("_current") else "previous"
+                results.append({
+                    "row_id": row_id,
+                    "report_period_end_dte": period_end_dte,
+                    "analizowany_okres": period,
+                    "relacja": f"Wartość ujemna niedozwolona: {col_key}",
+                    "rodzic": col_key,
+                    "wartosc_rodzica": val,
+                    "dzieci": [],
+                    "suma_dzieci": 0.0,
+                    "roznica": round(abs(val), 2),
+                    "roznica_procentowa": 100.0,
+                    "status": "FAIL"
+                })
+
+        # --- TEST 2: Walidacja sum kontrolnych (Poziomy 0, 1, 2) ---
         def check_sum(parent_key: str, child_keys: list, label: str):
             if not child_keys or parent_key not in data:
                 return
@@ -39,19 +75,14 @@ def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
             children_vals = [data.get(k, 0.0) for k in child_keys]
             children_val = sum(children_vals)
             
-            # Warunek braku raportowania: wszystkie dzieci mają wartość 0.0
+            # Jeśli brak raportowania uszczegółowienia (wszystkie dzieci = 0) -> PASS
             all_children_zero = all(v == 0.0 for v in children_vals)
 
             diff = abs(parent_val - children_val)
             max_val = max(abs(parent_val), abs(children_val))
 
             tolerance = 0.01 * max_val if max_val > 0 else 0.0
-            
-            # Jeśli brak raportowania uszczegółowienia (sam zeros) -> zaliczamy jako PASS
-            if all_children_zero:
-                passed = True
-            else:
-                passed = diff <= tolerance
+            passed = True if all_children_zero else (diff <= tolerance)
 
             rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
 
@@ -70,13 +101,12 @@ def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
             })
 
         for period in periods:
-            # --- POZIOM 0: Aktywa == Pasywa ---
-            akt_lvl0 = f"Aktywa_{period}"
-            pas_lvl0 = f"Pasywa_{period}"
+            # Poziom 0: Aktywa == Pasywa
+            akt_lvl0, pas_lvl0 = f"Aktywa_{period}", f"Pasywa_{period}"
             if akt_lvl0 in data and pas_lvl0 in data:
                 check_sum(akt_lvl0, [pas_lvl0], f"{period} - Poziom 0: Aktywa == Pasywa")
 
-            # --- POZIOM 1: Aktywa/Pasywa = Litery (A..I) ---
+            # Poziom 1 i 2
             for section in ["Aktywa", "Pasywa"]:
                 root = f"{section}_{period}"
                 pattern_lvl1 = re.compile(rf"^{section}_([A-I])_{period}$", re.IGNORECASE)
@@ -87,7 +117,6 @@ def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
                 if lvl1_children:
                     check_sum(root, lvl1_children, f"{period} - Poziom 1: {section} = sum(A..I)")
 
-                # --- POZIOM 2: Litera (A..I) = Liczby rzymskie (I..X) ---
                 for parent_lvl1 in lvl1_children:
                     match = pattern_lvl1.match(parent_lvl1)
                     if not match:
