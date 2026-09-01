@@ -1,68 +1,39 @@
+import re
 from typing import Dict, List, Any
 
-def normalize_and_flatten(data: Any, parent_key: str = '') -> Dict[str, float]:
+def validate_balance_sheet(data: Dict[str, float]) -> List[Dict[str, Any]]:
     """
-    Automatycznie przekształca zagnieżdżone słowniki na płaską strukturę, 
-    konwertuje klucze na WIELKIE LITERY i zamienia wartości na float.
+    Walidacja bilansu z sufiksami '_current' oraz '_previous'.
+    
+    Struktura:
+    - Lv 0: Aktywa_current / Pasywa_current
+    - Lv 1: Aktywa_[A-I]_current
+    - Lv 2: Aktywa_[A-I]_[I-X]_current
+    
+    Tolerancja błędu: max 1% wyższej wartości.
     """
-    items = {}
-    if isinstance(data, dict):
-        for k, v in data.items():
-            clean_k = str(k).upper().strip()
-            # Wyciąganie nazwy bez ewentualnych prefiksów XML (np. 'ns:AKTYWA' -> 'AKTYWA')
-            if ":" in clean_k:
-                clean_k = clean_k.split(":")[-1]
-                
-            new_key = f"{parent_key}_{clean_k}" if parent_key else clean_k
-            
-            if isinstance(v, dict):
-                items.update(normalize_and_flatten(v, new_key))
-            else:
-                try:
-                    if v is not None:
-                        items[new_key] = float(v)
-                except (ValueError, TypeError):
-                    pass
-    return items
-
-def validate_dynamic_balance_sheet(raw_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    # 1. Normalizacja danych wejściowych
-    data = normalize_and_flatten(raw_data)
     results = []
+    periods = ["current", "previous"]
 
-    # Szukanie głównych węzłów korzenia (obsługuje 'AKTYWA', 'AKTYWA_RAZEM' itp.)
-    root_aktywa = next((k for k in data.keys() if k in ["AKTYWA", "AKTYWA_RAZEM"]), None)
-    root_pasywa = next((k for k in data.keys() if k in ["PASYWA", "PASYWA_RAZEM"]), None)
+    def get_val(key: str) -> float:
+        return float(data.get(key, 0.0))
 
-    if not root_aktywa and not root_pasywa:
-        print("UWAGA: Nie znaleziono kluczy AKTYWA / PASYWA w słowniku. Dostępne klucze:", list(data.keys())[:10])
-        return []
-
-    def get_direct_children(parent_key: str) -> List[str]:
-        prefix = parent_key + "_"
-        children = []
-        for key in data.keys():
-            if key.startswith(prefix):
-                suffix = key[len(prefix):]
-                # Szukamy bezpośrednich dzieci (brak kolejnego separatora '_')
-                if "_" not in suffix:
-                    children.append(key)
-        return sorted(children)
-
-    def check_parent_children(parent_key: str, child_keys: List[str], label: str):
+    def check_sum(parent_key: str, child_keys: List[str], label: str):
         if not child_keys or parent_key not in data:
             return
 
-        parent_val = float(data.get(parent_key, 0.0))
-        children_val = sum(float(data.get(k, 0.0)) for k in child_keys)
+        parent_val = get_val(parent_key)
+        children_val = sum(get_val(k) for k in child_keys)
         diff = abs(parent_val - children_val)
         max_val = max(abs(parent_val), abs(children_val))
 
+        # Warunek 1% wyższej wartości
         tolerance = 0.01 * max_val if max_val > 0 else 0.0
         passed = diff <= tolerance
         rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
 
         results.append({
+            "okres": label.split()[0],
             "relacja": label,
             "rodzic": parent_key,
             "wartosc_rodzica": parent_val,
@@ -73,25 +44,43 @@ def validate_dynamic_balance_sheet(raw_data: Dict[str, Any]) -> List[Dict[str, A
             "status": "PASS" if passed else "FAIL"
         })
 
-    # --- POZIOM 0 ---
-    if root_aktywa and root_pasywa:
-        check_parent_children(root_aktywa, [root_pasywa], "Poziom 0: Aktywa == Pasywa")
+    for period in periods:
+        # --- POZIOM 0: Aktywa == Pasywa ---
+        akt_lvl0 = f"Aktywa_{period}"
+        pas_lvl0 = f"Pasywa_{period}"
+        if akt_lvl0 in data and pas_lvl0 in data:
+            check_sum(akt_lvl0, [pas_lvl0], f"{period} - Poziom 0: Aktywa == Pasywa")
 
-    # --- POZIOM 1 ---
-    for root in [root_aktywa, root_pasywa]:
-        if root:
-            children = get_direct_children(root)
-            if children:
-                check_parent_children(root, children, f"Poziom 1: {root} = suma dzieci")
+        # --- POZIOM 1: Aktywa/Pasywa = litery A..I ---
+        for section in ["Aktywa", "Pasywa"]:
+            root = f"{section}_{period}"
+            
+            # Wzorzec dopasowujący np. Aktywa_A_current, Pasywa_B_previous
+            pattern_lvl1 = re.compile(rf"^{section}_([A-I])_{period}$", re.IGNORECASE)
+            
+            lvl1_children = [k for k in data.keys() if pattern_lvl1.match(k)]
+            lvl1_children.sort(key=lambda x: pattern_lvl1.match(x).group(1))
 
-    # --- POZIOM 2 ---
-    level1_keys = []
-    if root_aktywa: level1_keys.extend(get_direct_children(root_aktywa))
-    if root_pasywa: level1_keys.extend(get_direct_children(root_pasywa))
+            if lvl1_children:
+                check_sum(root, lvl1_children, f"{period} - Poziom 1: {section} = sum(A..I)")
 
-    for lvl1_key in level1_keys:
-        children = get_direct_children(lvl1_key)
-        if children:
-            check_parent_children(lvl1_key, children, f"Poziom 2: {lvl1_key} = suma dzieci")
+            # --- POZIOM 2: Litera (np. Aktywa_A) = liczby rzymskie (I..X) ---
+            for parent_lvl1 in lvl1_children:
+                match = pattern_lvl1.match(parent_lvl1)
+                if not match:
+                    continue
+                letter = match.group(1)
+
+                # Wzorzec dopasowujący np. Aktywa_A_I_current, Aktywa_A_VIII_current
+                pattern_lvl2 = re.compile(rf"^{section}_{letter}_([IVXLCDM]+)_{period}$", re.IGNORECASE)
+                
+                lvl2_children = [k for k in data.keys() if pattern_lvl2.match(k)]
+                
+                if lvl2_children:
+                    check_sum(
+                        parent_lvl1, 
+                        lvl2_children, 
+                        f"{period} - Poziom 2: {section}_{letter} = sum(I..X)"
+                    )
 
     return results
