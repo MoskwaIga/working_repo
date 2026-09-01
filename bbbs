@@ -3,94 +3,88 @@ import pandas as pd
 
 def validate_balance_sheet_df(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Waliduje sumy kontrolne z DataFrame bilansu do 2 poziomów w dół.
-    Obsługuje tolerancję odchyłki do 1% wyższej kwoty.
+    Waliduje sumy kontrolne bilansu w DataFrame do 2 poziomów w dół.
+    Automatycznie filtruje kolumny techniczne (KRS, daty), analizując wyłącznie 
+    kolumny rozpoczynające się od 'Aktywa_' lub 'Pasywa_'.
     """
-    data = {}
-    
-    # FORMAT 1: Układ szeroki (kolumny to np. 'Aktywa_A_current', 'Pasywa_B_I_previous')
-    if any(re.search(r'_(current|previous)$', str(c), re.IGNORECASE) for c in df.columns):
-        row = df.iloc[0]
-        for col in df.columns:
-            val = row[col]
-            data[str(col)] = float(val) if pd.notna(val) else 0.0
-            
-    # FORMAT 2: Układ pionowy (indeks/kolumna to np. 'Aktywa_A', a kolumny to 'current' i 'previous')
-    else:
-        temp_df = df.copy()
-        if 'pozycja' in temp_df.columns:
-            temp_df = temp_df.set_index('pozycja')
-        elif 'symbol' in temp_df.columns:
-            temp_df = temp_df.set_index('symbol')
-            
-        for pos in temp_df.index:
-            for col in temp_df.columns:
-                col_str = str(col).lower()
-                if col_str in ['current', 'previous']:
-                    key = f"{pos}_{col_str}"
-                    val = temp_df.loc[pos, col]
-                    data[key] = float(val) if pd.notna(val) else 0.0
-
     results = []
-    periods = ["current", "previous"]
 
-    def check_sum(parent_key: str, child_keys: list, label: str):
-        if not child_keys or parent_key not in data:
-            return
+    # Wybieramy tylko kolumny z danymi bilansowymi
+    balance_cols = [c for c in df.columns if re.match(r'^(Aktywa|Pasywa)_', str(c), re.IGNORECASE)]
 
-        parent_val = data.get(parent_key, 0.0)
-        children_val = sum(data.get(k, 0.0) for k in child_keys)
-        diff = abs(parent_val - children_val)
-        max_val = max(abs(parent_val), abs(children_val))
+    for row_idx, row in df.iterrows():
+        # Budujemy słownik czystych wartości liczbowych dla danego wiersza
+        data = {}
+        for col in balance_cols:
+            val = row[col]
+            try:
+                data[str(col)] = float(val) if pd.notna(val) else 0.0
+            except (ValueError, TypeError):
+                data[str(col)] = 0.0
 
-        # Warunek odchylenia: max 1% wyższej wartości
-        tolerance = 0.01 * max_val if max_val > 0 else 0.0
-        passed = diff <= tolerance
-        rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
+        # Identyfikator sprawozdania (używa KRS/id z tabeli lub indeksu wiersza)
+        row_id = row.get('krs', row.get('KRS', row_idx))
+        periods = ["current", "previous"]
 
-        results.append({
-            "okres": label.split()[0],
-            "relacja": label,
-            "rodzic": parent_key,
-            "wartosc_rodzica": parent_val,
-            "suma_dzieci": children_val,
-            "roznica": round(diff, 2),
-            "roznica_procentowa": round(rel_diff, 2),
-            "status": "PASS" if passed else "FAIL"
-        })
+        def check_sum(parent_key: str, child_keys: list, label: str):
+            if not child_keys or parent_key not in data:
+                return
 
-    for period in periods:
-        # --- POZIOM 0: Aktywa == Pasywa ---
-        akt_lvl0 = f"Aktywa_{period}"
-        pas_lvl0 = f"Pasywa_{period}"
-        if akt_lvl0 in data and pas_lvl0 in data:
-            check_sum(akt_lvl0, [pas_lvl0], f"{period} - Poziom 0: Aktywa == Pasywa")
+            parent_val = data.get(parent_key, 0.0)
+            children_val = sum(data.get(k, 0.0) for k in child_keys)
+            diff = abs(parent_val - children_val)
+            max_val = max(abs(parent_val), abs(children_val))
 
-        # --- POZIOM 1: Aktywa/Pasywa = Litery (A..I) ---
-        for section in ["Aktywa", "Pasywa"]:
-            root = f"{section}_{period}"
-            pattern_lvl1 = re.compile(rf"^{section}_([A-I])_{period}$", re.IGNORECASE)
-            
-            lvl1_children = [k for k in data.keys() if pattern_lvl1.match(k)]
-            lvl1_children.sort(key=lambda x: pattern_lvl1.match(x).group(1))
+            # Progowanie tolerancji: max 1% wyższej wartości
+            tolerance = 0.01 * max_val if max_val > 0 else 0.0
+            passed = diff <= tolerance
+            rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
 
-            if lvl1_children:
-                check_sum(root, lvl1_children, f"{period} - Poziom 1: {section} = sum(A..I)")
+            results.append({
+                "row_id": row_id,
+                "okres": label.split()[0],
+                "relacja": label,
+                "rodzic": parent_key,
+                "wartosc_rodzica": parent_val,
+                "dzieci": child_keys,
+                "suma_dzieci": children_val,
+                "roznica": round(diff, 2),
+                "roznica_procentowa": round(rel_diff, 2),
+                "status": "PASS" if passed else "FAIL"
+            })
 
-            # --- POZIOM 2: Litera (A..I) = Liczby rzymskie (I..X) ---
-            for parent_lvl1 in lvl1_children:
-                match = pattern_lvl1.match(parent_lvl1)
-                if not match:
-                    continue
-                letter = match.group(1)
-                pattern_lvl2 = re.compile(rf"^{section}_{letter}_([IVXLCDM]+)_{period}$", re.IGNORECASE)
-                
-                lvl2_children = [k for k in data.keys() if pattern_lvl2.match(k)]
-                if lvl2_children:
-                    check_sum(
-                        parent_lvl1, 
-                        lvl2_children, 
-                        f"{period} - Poziom 2: {section}_{letter} = sum(I..X)"
-                    )
+        for period in periods:
+            # --- POZIOM 0: Aktywa == Pasywa ---
+            akt_lvl0 = f"Aktywa_{period}"
+            pas_lvl0 = f"Pasywa_{period}"
+            if akt_lvl0 in data and pas_lvl0 in data:
+                check_sum(akt_lvl0, [pas_lvl0], f"{period} - Poziom 0: Aktywa == Pasywa")
+
+            # --- POZIOM 1: Aktywa/Pasywa = Litery (A..I) ---
+            for section in ["Aktywa", "Pasywa"]:
+                root = f"{section}_{period}"
+                pattern_lvl1 = re.compile(rf"^{section}_([A-I])_{period}$", re.IGNORECASE)
+
+                lvl1_children = [k for k in data.keys() if pattern_lvl1.match(k)]
+                lvl1_children.sort(key=lambda x: pattern_lvl1.match(x).group(1))
+
+                if lvl1_children:
+                    check_sum(root, lvl1_children, f"{period} - Poziom 1: {section} = sum(A..I)")
+
+                # --- POZIOM 2: Litera (A..I) = Liczby rzymskie (I..X) ---
+                for parent_lvl1 in lvl1_children:
+                    match = pattern_lvl1.match(parent_lvl1)
+                    if not match:
+                        continue
+                    letter = match.group(1)
+                    pattern_lvl2 = re.compile(rf"^{section}_{letter}_([IVXLCDM]+)_{period}$", re.IGNORECASE)
+
+                    lvl2_children = [k for k in data.keys() if pattern_lvl2.match(k)]
+                    if lvl2_children:
+                        check_sum(
+                            parent_lvl1,
+                            lvl2_children,
+                            f"{period} - Poziom 2: {section}_{letter} = sum(I..X)"
+                        )
 
     return pd.DataFrame(results)
