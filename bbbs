@@ -1,111 +1,227 @@
 import re
 import pandas as pd
 
+
 def safe_float(val) -> float:
-    """Konwertuje wartości liczbowe z obsługą pustych pól i formatów księgowych."""
     if pd.isna(val):
         return 0.0
     if isinstance(val, (int, float)):
         return float(val)
     val_str = str(val).strip()
-    if val_str.startswith('(') and val_str.endswith(')'):
-        val_str = '-' + val_str[1:-1]
+    if val_str.startswith("(") and val_str.endswith(")"):
+        val_str = "-" + val_str[1:-1]
     try:
-        return float(val_str.replace(' ', '').replace(',', '.'))
+        return float(val_str.replace(" ", "").replace(",", "."))
     except (ValueError, TypeError):
         return 0.0
 
-def validate_rzis_df(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Sprawdza każde równanie kaskadowe i hierarchiczne w RZiS z tolerancją 1%.
-    """
+
+def detect_variant(data: dict, p: str) -> str:
+    """Automatycznie identyfikuje wariant RZiS na podstawie dostępnych kluczy oraz spójności wzorów."""
+    if f"O_{p}" in data:
+        return "INNA_KALKULACYJNY"
+    if f"G_{p}" in data and f"H_{p}" not in data:
+        return "MIKRO"
+    if f"J_{p}" in data and f"K_{p}" not in data and f"L_{p}" not in data:
+        return "MALA_POROWNAWCZY"
+    if f"L_{p}" in data and f"E_{p}" in data:
+        val_a, val_b = data.get(f"A_{p}", 0.0), data.get(f"B_{p}", 0.0)
+        val_c, val_d = data.get(f"C_{p}", 0.0), data.get(f"D_{p}", 0.0)
+        val_e = data.get(f"E_{p}", 0.0)
+
+        diff_inna_porow = abs(val_c - (val_a - val_b))
+        diff_mala_kalk = abs(val_e - (val_a - val_b - val_c - val_d))
+        if diff_mala_kalk < diff_inna_porow:
+            return "MALA_KALKULACYJNY"
+
+    return "INNA_POROWNAWCZY"
+
+
+def validate_rzis_df(
+    df: pd.DataFrame, abs_tolerance: float = 1.0
+) -> pd.DataFrame:
     results = []
-    
-    # Wykrywanie kolumn RZiS (np. A_current, A_I_previous, B_VIII_current)
-    rzis_pattern = re.compile(r'^[A-Z](_[IVXLCDM]+)*_(current|previous)$', re.IGNORECASE)
+    rzis_pattern = re.compile(
+        r"^[A-Z](?:_[A-Z0-9a-z]+)*_(current|previous)$", re.IGNORECASE
+    )
     rzis_cols = [c for c in df.columns if rzis_pattern.match(str(c))]
 
     for row_idx, row in df.iterrows():
         data = {str(col): safe_float(row[col]) for col in rzis_cols}
-        krs = row.get('krs', row_idx)
-        period_end_dte = row.get('report_period_end_dte', None)
+        krs = row.get("krs", row_idx)
+        period_end_dte = row.get("report_period_end_dte", None)
 
-        periods = ["current", "previous"]
+        for p in ["current", "previous"]:
+            variant = detect_variant(data, p)
 
-        def check_equation(target_key: str, calc_val: float, label: str, period: str, child_keys: list = None):
-            if target_key not in data:
-                return
+            def check_eq(target_key: str, calc_val: float, label: str):
+                if target_key not in data:
+                    return
+                target_val = data.get(target_key, 0.0)
+                diff = abs(target_val - calc_val)
+                max_val = max(abs(target_val), abs(calc_val))
 
-            target_val = data.get(target_key, 0.0)
-            diff = abs(target_val - calc_val)
-            max_val = max(abs(target_val), abs(calc_val))
-            tolerance = 0.01 * max_val if max_val > 0 else 0.0
-
-            # Jeśli sprawdzamy podpozycje i wszystkie wynoszą 0.0 -> PASS (brak uszczegółowienia)
-            if child_keys and all(data.get(k, 0.0) == 0.0 for k in child_keys):
-                passed = True
-            else:
+                tolerance = max(abs_tolerance, 0.0001 * max_val)
                 passed = diff <= tolerance
+                rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
 
-            rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
+                results.append(
+                    {
+                        "krs": krs,
+                        "report_period_end_dte": period_end_dte,
+                        "analizowany_okres": p,
+                        "wariant_rzis": variant,
+                        "relacja": label,
+                        "pozycja_wykazana": target_key,
+                        "wartosc_wykazana": round(target_val, 2),
+                        "wartosc_obliczona": round(calc_val, 2),
+                        "roznica": round(diff, 2),
+                        "roznica_procentowa": round(rel_diff, 2),
+                        "status": "PASS" if passed else "FAIL",
+                    }
+                )
 
-            results.append({
-                "krs": krs,
-                "report_period_end_dte": period_end_dte,
-                "analizowany_okres": period,
-                "relacja": label,
-                "pozycja_wykazana": target_key,
-                "wartosc_wykazana": round(target_val, 2),
-                "wartosc_obliczona": round(calc_val, 2),
-                "roznica": round(diff, 2),
-                "roznica_procentowa": round(rel_diff, 2),
-                "status": "PASS" if passed else "FAIL"
-            })
+            # --- WALIDACJA STRUKTURALNA (KASKADOWA) ---
+            if variant == "MIKRO":
+                # 1. RZiSJednostkaMicro
+                check_eq(
+                    f"F_{p}",
+                    data.get(f"A_{p}", 0.0)
+                    - data.get(f"B_{p}", 0.0)
+                    + data.get(f"C_{p}", 0.0)
+                    - data.get(f"D_{p}", 0.0)
+                    - data.get(f"E_{p}", 0.0),
+                    f"{p} - F = A - B + C - D - E",
+                )
+                check_eq(f"G_{p}", data.get(f"F_{p}", 0.0), f"{p} - G = F")
 
-        for p in periods:
-            # Wykrywanie wariantu RZiS na podstawie obecności pozycji końcowych
-            is_kalkulacyjny = f"O_{p}" in data or (f"M_{p}" in data and f"N_{p}" in data)
+            elif variant == "MALA_POROWNAWCZY":
+                # 2. RZiSJednostkaMala + RZiSPor
+                check_eq(
+                    f"C_{p}",
+                    data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
+                    f"{p} - C = A - B",
+                )
+                check_eq(
+                    f"H_{p}",
+                    data.get(f"C_{p}", 0.0)
+                    + data.get(f"D_{p}", 0.0)
+                    - data.get(f"E_{p}", 0.0)
+                    + data.get(f"F_{p}", 0.0)
+                    - data.get(f"G_{p}", 0.0),
+                    f"{p} - H = C + D - E + F - G",
+                )
+                check_eq(
+                    f"J_{p}",
+                    data.get(f"H_{p}", 0.0) - data.get(f"I_{p}", 0.0),
+                    f"{p} - J = H - I",
+                )
 
-            if is_kalkulacyjny:
-                # --- WARIANT KALKULACYJNY ---
-                if f"A_{p}" in data and f"B_{p}" in data:
-                    check_equation(f"C_{p}", data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0), f"{p} - C = A - B (Zysk ze sprzedaży brutto)", p)
-                if f"C_{p}" in data and f"D_{p}" in data and f"E_{p}" in data:
-                    check_equation(f"F_{p}", data.get(f"C_{p}", 0.0) - data.get(f"D_{p}", 0.0) - data.get(f"E_{p}", 0.0), f"{p} - F = C - D - E (Zysk ze sprzedaży)", p)
-                if f"F_{p}" in data and f"G_{p}" in data and f"H_{p}" in data:
-                    check_equation(f"I_{p}", data.get(f"F_{p}", 0.0) + data.get(f"G_{p}", 0.0) - data.get(f"H_{p}", 0.0), f"{p} - I = F + G - H (EBIT)", p)
-                if f"I_{p}" in data and f"J_{p}" in data and f"K_{p}" in data:
-                    check_equation(f"L_{p}", data.get(f"I_{p}", 0.0) + data.get(f"J_{p}", 0.0) - data.get(f"K_{p}", 0.0), f"{p} - L = I + J - K (Zysk brutto)", p)
-                if f"L_{p}" in data and f"M_{p}" in data and f"N_{p}" in data:
-                    check_equation(f"O_{p}", data.get(f"L_{p}", 0.0) - data.get(f"M_{p}", 0.0) - data.get(f"N_{p}", 0.0), f"{p} - O = L - M - N (Zysk netto)", p)
-            else:
-                # --- WARIANT PORÓWNAWCZY ---
-                if f"A_{p}" in data and f"B_{p}" in data:
-                    check_equation(f"C_{p}", data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0), f"{p} - C = A - B (Zysk ze sprzedaży)", p)
-                if f"C_{p}" in data and f"D_{p}" in data and f"E_{p}" in data:
-                    check_equation(f"F_{p}", data.get(f"C_{p}", 0.0) + data.get(f"D_{p}", 0.0) - data.get(f"E_{p}", 0.0), f"{p} - F = C + D - E (EBIT)", p)
-                if f"F_{p}" in data and f"G_{p}" in data and f"H_{p}" in data:
-                    check_equation(f"I_{p}", data.get(f"F_{p}", 0.0) + data.get(f"G_{p}", 0.0) - data.get(f"H_{p}", 0.0), f"{p} - I = F + G - H (Zysk brutto)", p)
-                if f"I_{p}" in data and f"J_{p}" in data and f"K_{p}" in data:
-                    check_equation(f"L_{p}", data.get(f"I_{p}", 0.0) - data.get(f"J_{p}", 0.0) - data.get(f"K_{p}", 0.0), f"{p} - L = I - J - K (Zysk netto)", p)
+            elif variant == "MALA_KALKULACYJNY":
+                # 3. RZiSJednostkaMala + RZiSKalk
+                check_eq(
+                    f"E_{p}",
+                    data.get(f"A_{p}", 0.0)
+                    - data.get(f"B_{p}", 0.0)
+                    - data.get(f"C_{p}", 0.0)
+                    - data.get(f"D_{p}", 0.0),
+                    f"{p} - E = A - B - C - D",
+                )
+                check_eq(
+                    f"J_{p}",
+                    data.get(f"E_{p}", 0.0)
+                    + data.get(f"F_{p}", 0.0)
+                    - data.get(f"G_{p}", 0.0)
+                    + data.get(f"H_{p}", 0.0)
+                    - data.get(f"I_{p}", 0.0),
+                    f"{p} - J = E + F - G + H - I",
+                )
+                check_eq(
+                    f"L_{p}",
+                    data.get(f"J_{p}", 0.0) - data.get(f"K_{p}", 0.0),
+                    f"{p} - L = J - K",
+                )
 
-            # --- SUMY HIERARCHICZNE PODPOZYCJI (A = sum(A_I..A_IV), B = sum(B_I..B_VIII) itp.) ---
-            pattern_lvl1 = re.compile(rf"^([A-Z])_{p}$", re.IGNORECASE)
-            lvl1_parents = [k for k in data.keys() if pattern_lvl1.match(k)]
+            elif variant == "INNA_KALKULACYJNY":
+                # 4. RZiSJednostkaInna + RZiSKalk
+                check_eq(
+                    f"C_{p}",
+                    data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
+                    f"{p} - C = A - B",
+                )
+                check_eq(
+                    f"F_{p}",
+                    data.get(f"C_{p}", 0.0)
+                    - data.get(f"D_{p}", 0.0)
+                    - data.get(f"E_{p}", 0.0),
+                    f"{p} - F = C - D - E",
+                )
+                check_eq(
+                    f"I_{p}",
+                    data.get(f"F_{p}", 0.0)
+                    + data.get(f"G_{p}", 0.0)
+                    - data.get(f"H_{p}", 0.0),
+                    f"{p} - I = F + G - H",
+                )
+                check_eq(
+                    f"L_{p}",
+                    data.get(f"I_{p}", 0.0)
+                    + data.get(f"J_{p}", 0.0)
+                    - data.get(f"K_{p}", 0.0),
+                    f"{p} - L = I + J - K",
+                )
+                check_eq(
+                    f"O_{p}",
+                    data.get(f"L_{p}", 0.0)
+                    - data.get(f"M_{p}", 0.0)
+                    - data.get(f"N_{p}", 0.0),
+                    f"{p} - O = L - M - N",
+                )
 
-            for parent_key in lvl1_parents:
-                letter = pattern_lvl1.match(parent_key).group(1)
-                pattern_lvl2 = re.compile(rf"^{letter}_([IVXLCDM]+)_{p}$", re.IGNORECASE)
-                
-                child_keys = [k for k in data.keys() if pattern_lvl2.match(k)]
+            elif variant == "INNA_POROWNAWCZY":
+                # 5. RZiSJednostkaInna + RZiSPor
+                check_eq(
+                    f"C_{p}",
+                    data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
+                    f"{p} - C = A - B",
+                )
+                check_eq(
+                    f"F_{p}",
+                    data.get(f"C_{p}", 0.0)
+                    + data.get(f"D_{p}", 0.0)
+                    - data.get(f"E_{p}", 0.0),
+                    f"{p} - F = C + D - E",
+                )
+                check_eq(
+                    f"I_{p}",
+                    data.get(f"F_{p}", 0.0)
+                    + data.get(f"G_{p}", 0.0)
+                    - data.get(f"H_{p}", 0.0),
+                    f"{p} - I = F + G - H",
+                )
+                check_eq(
+                    f"K_{p}",
+                    data.get(f"I_{p}", 0.0) - data.get(f"J_{p}", 0.0),
+                    f"{p} - K = I - J",
+                )
+
+            # --- WALIDACJA HIERARCHICZNA (SUMOWANIE DRZEWA PODPOZYCJI) ---
+            for parent_key in list(data.keys()):
+                if not parent_key.lower().endswith(f"_{p}"):
+                    continue
+
+                base_name = parent_key[: -len(f"_{p}")]
+                child_pattern = re.compile(
+                    rf"^{re.escape(base_name)}_[^_]+_{p}$", re.IGNORECASE
+                )
+                child_keys = [k for k in data.keys() if child_pattern.match(k)]
+
                 if child_keys:
-                    calc_children_sum = sum(data.get(k, 0.0) for k in child_keys)
-                    check_equation(
-                        parent_key, 
-                        calc_children_sum, 
-                        f"{p} - Suma podpozycji dla {letter}", 
-                        p, 
-                        child_keys=child_keys
+                    calc_sum = sum(data.get(k, 0.0) for k in child_keys)
+                    check_eq(
+                        parent_key,
+                        calc_sum,
+                        f"{p} - Suma podpozycji dla {base_name}",
                     )
 
     return pd.DataFrame(results)
