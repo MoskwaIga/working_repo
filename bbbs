@@ -17,13 +17,7 @@ def safe_float(val) -> float:
 
 
 def detect_variant(row: pd.Series, data: dict, p: str) -> str:
-    """Identyfikuje wariant RZiS:
-
-    1. Priorytetowo na podstawie metadanych (schema_type,
-    income_statement_schema itp.)
-    2. Fallback na podstawie faktycznie wypełnionych (niezerowych) pozycji.
-    """
-    # 1. Sprawdzanie metadanych w wierszu
+    """Identyfikuje wariant RZiS na podstawie metadanych lub niezerowych pozycji."""
     meta_cols = [
         "schema_type",
         "income_statement_schema",
@@ -33,18 +27,21 @@ def detect_variant(row: pd.Series, data: dict, p: str) -> str:
         "variant",
     ]
     meta_val = " ".join(
-        [str(row[c]).upper() for c in meta_cols if c in row and pd.notna(row[c])]
+        [str(row[c]).lower() for c in meta_cols if c in row and pd.notna(row[c])]
     )
 
+    # 1. Sprawdzanie metadanych
     if meta_val:
-        is_micro = "MICRO" in meta_val or "MIKRO" in meta_val
-        is_mala = "MALA" in meta_val or "MAŁA" in meta_val or "SMALL" in meta_val
-        is_inna = "INNA" in meta_val or "OTHER" in meta_val
-        is_kalk = "KALK" in meta_val or "CALC" in meta_val
-        is_por = "POR" in meta_val or "COMPAR" in meta_val
-
-        if is_micro:
+        if "mikro" in meta_val or "micro" in meta_val:
             return "MIKRO"
+
+        is_mala = (
+            "mala" in meta_val or "mała" in meta_val or "small" in meta_val
+        )
+        is_inna = "inna" in meta_val or "other" in meta_val
+        is_kalk = "kalk" in meta_val or "calc" in meta_val
+        is_por = "por" in meta_val or "compar" in meta_val
+
         if is_mala and is_kalk:
             return "MALA_KALKULACYJNY"
         if is_mala and is_por:
@@ -82,8 +79,6 @@ def validate_rzis_df(
     df: pd.DataFrame, abs_tolerance: float = 1.0
 ) -> pd.DataFrame:
     results = []
-
-    # Dopasowuje wszystkie struktury RZiS (np. A_I_1_a_current, G_I_A_current)
     rzis_pattern = re.compile(
         r"^[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*_(current|previous)$", re.IGNORECASE
     )
@@ -126,7 +121,6 @@ def validate_rzis_df(
 
             # --- WALIDACJA STRUKTURALNA (KASKADOWA) ---
             if variant == "MIKRO":
-                # F = A - B + C - D - E (usunięto G = F)
                 check_eq(
                     f"F_{p}",
                     data.get(f"A_{p}", 0.0)
@@ -243,8 +237,16 @@ def validate_rzis_df(
                     f"{p} - K = I - J",
                 )
 
+                if f"L_{p}" in data:
+                    check_eq(
+                        f"L_{p}",
+                        data.get(f"I_{p}", 0.0)
+                        + data.get(f"J_{p}", 0.0)
+                        - data.get(f"K_{p}", 0.0),
+                        f"{p} - L = I + J - K",
+                    )
+
             # --- WALIDACJA HIERARCHICZNA (SEGMENTOWA) ---
-            # Precyzyjne dopasowanie bezpośrednich dzieci po segmentach klucza
             for parent_key in list(data.keys()):
                 if not parent_key.lower().endswith(f"_{p}"):
                     continue
@@ -259,7 +261,6 @@ def validate_rzis_df(
                     child_base = k[: -len(f"_{p}")]
                     child_parts = child_base.split("_")
 
-                    # Dziecko bezpośrednie ma dokładnie o 1 segment więcej i współdzieli prefiks
                     if (
                         len(child_parts) == len(parent_parts) + 1
                         and child_parts[: len(parent_parts)] == parent_parts
