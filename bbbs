@@ -17,30 +17,41 @@ def safe_float(val) -> float:
 
 
 def detect_variant(row: pd.Series, data: dict, p: str) -> str:
-    """Identyfikuje wariant RZiS na podstawie metadanych lub niezerowych pozycji."""
-    meta_cols = [
-        "schema_type",
-        "income_statement_schema",
-        "income_statement_tag",
-        "wariant_rzis",
-        "wariant",
-        "variant",
-    ]
-    meta_val = " ".join(
-        [str(row[c]).lower() for c in meta_cols if c in row and pd.notna(row[c])]
-    )
+    """Detekcja wariantu RZiS z priorytetem dla income_statement_schema i income_statement_tag."""
+    schema = str(row.get("income_statement_schema", "")).strip().lower()
+    tag = str(row.get("income_statement_tag", "")).strip().lower()
+    combined_meta = f"{schema} {tag}".strip()
 
-    # 1. Sprawdzanie metadanych
-    if meta_val:
-        if "mikro" in meta_val or "micro" in meta_val:
-            return "MIKRO"
+    # Fallback na inne kolumny metadanych
+    if not combined_meta:
+        meta_cols = ["schema_type", "wariant_rzis", "wariant", "variant"]
+        combined_meta = " ".join(
+            [
+                str(row[c]).lower()
+                for c in meta_cols
+                if c in row and pd.notna(row[c])
+            ]
+        )
+
+    # 1. Determinacja na podstawie metadanych (schema / tag)
+    if combined_meta:
+        if "mikro" in combined_meta or "micro" in combined_meta:
+            if (
+                "pelny" in combined_meta
+                or "pełny" in combined_meta
+                or f"N_{p}" in data
+            ):
+                return "MIKRO_PELNY"
+            return "MIKRO_UPROSZCZONY"
 
         is_mala = (
-            "mala" in meta_val or "mała" in meta_val or "small" in meta_val
+            "mala" in combined_meta
+            or "mała" in combined_meta
+            or "small" in combined_meta
         )
-        is_inna = "inna" in meta_val or "other" in meta_val
-        is_kalk = "kalk" in meta_val or "calc" in meta_val
-        is_por = "por" in meta_val or "compar" in meta_val
+        is_inna = "inna" in combined_meta or "other" in combined_meta
+        is_kalk = "kalk" in combined_meta or "calc" in combined_meta
+        is_por = "por" in combined_meta or "compar" in combined_meta
 
         if is_mala and is_kalk:
             return "MALA_KALKULACYJNY"
@@ -51,26 +62,32 @@ def detect_variant(row: pd.Series, data: dict, p: str) -> str:
         if is_inna and is_por:
             return "INNA_POROWNAWCZY"
 
-    # 2. Fallback: weryfikacja niezerowych wartości w danych
+        if is_kalk:
+            return (
+                "INNA_KALKULACYJNY" if f"O_{p}" in data else "MALA_KALKULACYJNY"
+            )
+        if is_por:
+            return (
+                "MALA_POROWNAWCZY"
+                if (f"H_{p}" in data and f"J_{p}" in data and f"K_{p}" not in data)
+                else "INNA_POROWNAWCZY"
+            )
+
+    # 2. Fallback na podstawie układu wypełnionych kluczy w danych
     def has_val(key: str) -> bool:
         val = data.get(key, 0.0)
         return pd.notna(val) and abs(val) > 1e-6
 
+    if has_val(f"N_{p}") and has_val(f"L_{p}"):
+        return "MIKRO_PELNY"
     if has_val(f"O_{p}"):
         return "INNA_KALKULACYJNY"
     if has_val(f"F_{p}") and not has_val(f"G_{p}") and not has_val(f"H_{p}"):
-        return "MIKRO"
-    if has_val(f"J_{p}") and not has_val(f"K_{p}") and not has_val(f"L_{p}"):
+        return "MIKRO_UPROSZCZONY"
+    if has_val(f"H_{p}") and has_val(f"J_{p}") and not has_val(f"K_{p}"):
         return "MALA_POROWNAWCZY"
-    if has_val(f"L_{p}") and has_val(f"E_{p}"):
-        val_a, val_b = data.get(f"A_{p}", 0.0), data.get(f"B_{p}", 0.0)
-        val_c, val_d = data.get(f"C_{p}", 0.0), data.get(f"D_{p}", 0.0)
-        val_e = data.get(f"E_{p}", 0.0)
-
-        diff_inna_porow = abs(val_c - (val_a - val_b))
-        diff_mala_kalk = abs(val_e - (val_a - val_b - val_c - val_d))
-        if diff_mala_kalk < diff_inna_porow:
-            return "MALA_KALKULACYJNY"
+    if has_val(f"E_{p}") and has_val(f"L_{p}") and not has_val(f"O_{p}"):
+        return "MALA_KALKULACYJNY"
 
     return "INNA_POROWNAWCZY"
 
@@ -120,7 +137,8 @@ def validate_rzis_df(
                 )
 
             # --- WALIDACJA STRUKTURALNA (KASKADOWA) ---
-            if variant == "MIKRO":
+            if variant == "MIKRO_UPROSZCZONY":
+                # 1. Mikro uproszczony
                 check_eq(
                     f"F_{p}",
                     data.get(f"A_{p}", 0.0)
@@ -131,7 +149,37 @@ def validate_rzis_df(
                     f"{p} - F = A - B + C - D - E",
                 )
 
+            elif variant == "MIKRO_PELNY":
+                # 2. Mikro pełny
+                check_eq(
+                    f"F_{p}",
+                    data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
+                    f"{p} - F = A - B",
+                )
+                check_eq(
+                    f"I_{p}",
+                    data.get(f"F_{p}", 0.0)
+                    + data.get(f"C_{p}", 0.0)
+                    - data.get(f"D_{p}", 0.0),
+                    f"{p} - I = F + C - D",
+                )
+                check_eq(
+                    f"L_{p}",
+                    data.get(f"I_{p}", 0.0)
+                    + data.get(f"G_{p}", 0.0)
+                    - data.get(f"H_{p}", 0.0),
+                    f"{p} - L = I + G - H",
+                )
+                check_eq(
+                    f"N_{p}",
+                    data.get(f"L_{p}", 0.0)
+                    - data.get(f"J_{p}", 0.0)
+                    - data.get(f"K_{p}", 0.0),
+                    f"{p} - N = L - J - K",
+                )
+
             elif variant == "MALA_POROWNAWCZY":
+                # 3. Porównawczy (Mała)
                 check_eq(
                     f"C_{p}",
                     data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
@@ -152,66 +200,8 @@ def validate_rzis_df(
                     f"{p} - J = H - I",
                 )
 
-            elif variant == "MALA_KALKULACYJNY":
-                check_eq(
-                    f"E_{p}",
-                    data.get(f"A_{p}", 0.0)
-                    - data.get(f"B_{p}", 0.0)
-                    - data.get(f"C_{p}", 0.0)
-                    - data.get(f"D_{p}", 0.0),
-                    f"{p} - E = A - B - C - D",
-                )
-                check_eq(
-                    f"J_{p}",
-                    data.get(f"E_{p}", 0.0)
-                    + data.get(f"F_{p}", 0.0)
-                    - data.get(f"G_{p}", 0.0)
-                    + data.get(f"H_{p}", 0.0)
-                    - data.get(f"I_{p}", 0.0),
-                    f"{p} - J = E + F - G + H - I",
-                )
-                check_eq(
-                    f"L_{p}",
-                    data.get(f"J_{p}", 0.0) - data.get(f"K_{p}", 0.0),
-                    f"{p} - L = J - K",
-                )
-
-            elif variant == "INNA_KALKULACYJNY":
-                check_eq(
-                    f"C_{p}",
-                    data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
-                    f"{p} - C = A - B",
-                )
-                check_eq(
-                    f"F_{p}",
-                    data.get(f"C_{p}", 0.0)
-                    - data.get(f"D_{p}", 0.0)
-                    - data.get(f"E_{p}", 0.0),
-                    f"{p} - F = C - D - E",
-                )
-                check_eq(
-                    f"I_{p}",
-                    data.get(f"F_{p}", 0.0)
-                    + data.get(f"G_{p}", 0.0)
-                    - data.get(f"H_{p}", 0.0),
-                    f"{p} - I = F + G - H",
-                )
-                check_eq(
-                    f"L_{p}",
-                    data.get(f"I_{p}", 0.0)
-                    + data.get(f"J_{p}", 0.0)
-                    - data.get(f"K_{p}", 0.0),
-                    f"{p} - L = I + J - K",
-                )
-                check_eq(
-                    f"O_{p}",
-                    data.get(f"L_{p}", 0.0)
-                    - data.get(f"M_{p}", 0.0)
-                    - data.get(f"N_{p}", 0.0),
-                    f"{p} - O = L - M - N",
-                )
-
             elif variant == "INNA_POROWNAWCZY":
+                # 3. Porównawczy (Inna)
                 check_eq(
                     f"C_{p}",
                     data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
@@ -245,6 +235,67 @@ def validate_rzis_df(
                         - data.get(f"K_{p}", 0.0),
                         f"{p} - L = I + J - K",
                     )
+
+            elif variant == "MALA_KALKULACYJNY":
+                # 4. Kalkulacyjny (Mała)
+                check_eq(
+                    f"E_{p}",
+                    data.get(f"A_{p}", 0.0)
+                    - data.get(f"B_{p}", 0.0)
+                    - data.get(f"C_{p}", 0.0)
+                    - data.get(f"D_{p}", 0.0),
+                    f"{p} - E = A - B - C - D",
+                )
+                check_eq(
+                    f"J_{p}",
+                    data.get(f"E_{p}", 0.0)
+                    + data.get(f"F_{p}", 0.0)
+                    - data.get(f"G_{p}", 0.0)
+                    + data.get(f"H_{p}", 0.0)
+                    - data.get(f"I_{p}", 0.0),
+                    f"{p} - J = E + F - G + H - I",
+                )
+                check_eq(
+                    f"L_{p}",
+                    data.get(f"J_{p}", 0.0) - data.get(f"K_{p}", 0.0),
+                    f"{p} - L = J - K",
+                )
+
+            elif variant == "INNA_KALKULACYJNY":
+                # 4. Kalkulacyjny (Inna)
+                check_eq(
+                    f"C_{p}",
+                    data.get(f"A_{p}", 0.0) - data.get(f"B_{p}", 0.0),
+                    f"{p} - C = A - B",
+                )
+                check_eq(
+                    f"F_{p}",
+                    data.get(f"C_{p}", 0.0)
+                    - data.get(f"D_{p}", 0.0)
+                    - data.get(f"E_{p}", 0.0),
+                    f"{p} - F = C - D - E",
+                )
+                check_eq(
+                    f"I_{p}",
+                    data.get(f"F_{p}", 0.0)
+                    + data.get(f"G_{p}", 0.0)
+                    - data.get(f"H_{p}", 0.0),
+                    f"{p} - I = F + G - H",
+                )
+                check_eq(
+                    f"L_{p}",
+                    data.get(f"I_{p}", 0.0)
+                    + data.get(f"J_{p}", 0.0)
+                    - data.get(f"K_{p}", 0.0),
+                    f"{p} - L = I + J - K",
+                )
+                check_eq(
+                    f"O_{p}",
+                    data.get(f"L_{p}", 0.0)
+                    - data.get(f"M_{p}", 0.0)
+                    - data.get(f"N_{p}", 0.0),
+                    f"{p} - O = L - M - N",
+                )
 
             # --- WALIDACJA HIERARCHICZNA (SEGMENTOWA) ---
             for parent_key in list(data.keys()):
