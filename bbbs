@@ -1,243 +1,169 @@
-from dataclasses import dataclass, field
-from typing import Optional
+import re
 import pandas as pd
-import numpy as np
+from typing import Dict, List, Optional, Set
 
-# ---------------------------------------------------------------------------
-# 1. RÓWNANIA PER STRUKTURA (bez zmian)
-# ---------------------------------------------------------------------------
-RZIS_EQUATIONS = {
-    ("mikro", None): [
-        ("F", [(+1, "A"), (-1, "B"), (+1, "C"), (-1, "D"), (-1, "E")]),
-        ("G", [(+1, "F")]),
-    ],
-    ("mala", "porownawczy"): [
-        ("C", [(+1, "A"), (-1, "B")]),
-        ("H", [(+1, "C"), (+1, "D"), (-1, "E"), (+1, "F"), (-1, "G")]),
-        ("J", [(+1, "H"), (-1, "I")]),
-    ],
-    ("mala", "kalkulacyjny"): [
-        ("E", [(+1, "A"), (-1, "B"), (-1, "C"), (-1, "D")]),
-        ("J", [(+1, "E"), (+1, "F"), (-1, "G"), (+1, "H"), (-1, "I")]),
-        ("L", [(+1, "J"), (-1, "K")]),
-    ],
-    ("inna", "porownawczy"): [
-        ("C", [(+1, "A"), (-1, "B")]),
-        ("F", [(+1, "C"), (+1, "D"), (-1, "E")]),
-        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
-        ("L", [(+1, "I"), (-1, "J"), (-1, "K")]),
-    ],
-    ("inna", "kalkulacyjny"): [
-        ("C", [(+1, "A"), (-1, "B")]),
-        ("F", [(+1, "C"), (-1, "D"), (-1, "E")]),
-        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
-        ("L", [(+1, "I"), (+1, "J"), (-1, "K")]),
-        ("O", [(+1, "L"), (-1, "M"), (-1, "N")]),
-    ],
+def safe_float(val) -> float:
+    """Konwertuje liczby, w tym formaty księgowe '(100)' na -100.0 oraz czyści białe znaki."""
+    if pd.isna(val):
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+
+    # Czyszczenie spacji (w tym twardych spacji \xa0)
+    val_str = str(val).replace('\xa0', '').strip()
+    if not val_str:
+        return 0.0
+
+    if val_str.startswith('(') and val_str.endswith(')'):
+        val_str = '-' + val_str[1:-1]
+
+    try:
+        return float(val_str.replace(' ', '').replace(',', '.'))
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def is_forbidden_negative(key: str) -> bool:
+    """Sprawdza, czy dana pozycja bilansowa ma bezwzględny zakaz wartości ujemnych."""
+    base_key = re.sub(r'_(current|previous)$', '', key, flags=re.IGNORECASE)
+
+    # Aktywa są wykazywane w wartościach netto (zawsze >= 0)
+    if base_key.startswith('Aktywa'):
+        return True
+
+    # Pasywa: Całość, Zobowiązania (Pasywa_B) i ich sub-pozycje nie mogą być ujemne.
+    # Kapitał własny (Pasywa_A) może być ujemny (np. strata z lat ubiegłych).
+    if base_key in ['Pasywa', 'Pasywa_B', 'Pasywa_A_I'] or base_key.startswith('Pasywa_B_'):
+        return True
+
+    return False
+
+
+NON_EXHAUSTIVE_LEVEL2_SCHEMAS: Set[str] = {
+    'BilansJednostkaMikro', 'SprFinJednostkaMikroWZlotych', 'JednostkaMikro',
 }
 
-COL_CURRENT = "{letter}_current"
-COL_PREVIOUS = "{letter}_previous"
 
-def _col(letter: str, period: str) -> str:
-    template = COL_CURRENT if period == "current" else COL_PREVIOUS
-    return template.format(letter=letter)
-
-def _unit_from_schema(schema_val) -> Optional[str]:
-    if pd.isna(schema_val):
-        return None
-    s = str(schema_val).lower()
-    if "mikro" in s:
-        return "mikro"
-    if "mala" in s or "małą" in s or "mała" in s:
-        return "mala"
-    if "inna" in s:
-        return "inna"
-    return None
-
-def _variant_from_tag(income_statement_tag) -> Optional[str]:
-    if pd.isna(income_statement_tag):
-        return None
-    s = str(income_statement_tag).lower()
-    if "por" in s:
-        return "porownawczy"
-    if "kalk" in s:
-        return "kalkulacyjny"
-    return None
-
-def resolve_rzis_structure(row: pd.Series) -> Optional[tuple]:
-    unit = _unit_from_schema(row.get("income_statement_schema"))
-    if unit is None:
-        unit = _unit_from_schema(row.get("schema_type"))
-
-    if unit == "mikro":
-        return ("mikro", None)
-
-    variant = _variant_from_tag(row.get("income_statement_tag"))
-    if unit in ("mala", "inna") and variant in ("porownawczy", "kalkulacyjny"):
-        return (unit, variant)
-
-    return None
-
-
-# ---------------------------------------------------------------------------
-# 2. STRUKTURA DANYCH Z AUDYTEM POPRAWIONYCH ZNAKÓW
-# ---------------------------------------------------------------------------
-
-@dataclass
-class EquationCheck:
-    period: str          # "current" / "previous"
-    equation: str        # litera wynikowa, np. "H"
-    lhs_col: str
-    expected: float
-    actual: float
-    diff: float
-    status: str          # "ok" / "ok_sign_corrected" / "mismatch" / "missing_data"
-    corrected_cols: str = "" # Lista kolumn składników, w których odwrócono znak (np. "B_current, D_current")
-
-
-# ---------------------------------------------------------------------------
-# 3. DWUETAPOWA WALIDACJA RÓWNAŃ
-# ---------------------------------------------------------------------------
-
-def check_row_equations(row: pd.Series, tolerance_abs: float = 1.0,
-                         tolerance_rel: float = 0.0005) -> list:
-    structure = resolve_rzis_structure(row)
-    if structure is None:
-        return [EquationCheck("both", "structure", "-", np.nan, np.nan, np.nan, "unknown_structure", "")]
-
-    equations = RZIS_EQUATIONS[structure]
+def validate_balance_sheet_df(
+    df: pd.DataFrame,
+    schema_col: str = 'balance_sheet_schema',
+    abs_tolerance: float = 1.0,   # Dopuszczalny błąd zaokrągleń w PLN (np. 1 zł)
+    rel_tolerance: float = 0.001  # Dopuszczalny błąd względny (0.1%)
+) -> pd.DataFrame:
+    """
+    Waliduje sumy kontrolne (Poziom 0/1/2) oraz niedozwolone wartości ujemne w DataFrame.
+    """
     results = []
+    
+    # Wyciągamy kolumny bilansowe raz przed pętlą
+    balance_cols = [c for c in df.columns if re.match(r'^(Aktywa|Pasywa)_', str(c), re.IGNORECASE)]
+    
+    # Pre-kompilacja wzorców Regex dla poprawy wydajności
+    pattern_lvl1_cache = {
+        sec: {
+            p: re.compile(rf"^{sec}_([A-Z])_{p}$", re.IGNORECASE) 
+            for p in ["current", "previous"]
+        } for sec in ["Aktywa", "Pasywa"]
+    }
 
-    for period in ("current", "previous"):
-        for lhs_letter, components in equations:
-            lhs_col = _col(lhs_letter, period)
-            lhs_value = row.get(lhs_col, np.nan)
-            
-            # Pobranie składników z zachowaniem nazwy kolumny do audytu: (sign, letter, col_name, value)
-            component_data = [
-                (sign, letter, _col(letter, period), row.get(_col(letter, period), np.nan))
-                for sign, letter in components
-            ]
+    for row_idx, row in df.iterrows():
+        data = {str(col): safe_float(row[col]) for col in balance_cols}
+        row_id = row.get('krs', row.get('KRS', row_idx))
+        period_end_dte = row.get('report_period_end_dte', None)
+        row_schema = row.get(schema_col) if schema_col and schema_col in df.columns else None
+        skip_level2 = row_schema in NON_EXHAUSTIVE_LEVEL2_SCHEMAS
 
-            if pd.isna(lhs_value) or any(pd.isna(v) for _, _, _, v in component_data):
-                results.append(EquationCheck(
-                    period=period, equation=lhs_letter, lhs_col=lhs_col,
-                    expected=np.nan, actual=lhs_value, diff=np.nan,
-                    status="missing_data", corrected_cols=""
-                ))
-                continue
+        periods = ["current", "previous"]
 
-            # --- PRÓBA 1: SUROWA (zgodnie z wprowadzonymi wartościami) ---
-            expected_raw = sum(sign * val for sign, _, _, val in component_data)
-            diff_raw = lhs_value - expected_raw
-            tol_raw = max(tolerance_abs, tolerance_rel * abs(expected_raw))
+        # --- TEST 1: Walidacja wartości ujemnych ---
+        for col_key, val in data.items():
+            if val < 0 and is_forbidden_negative(col_key):
+                period = "current" if col_key.lower().endswith("_current") else "previous"
+                results.append({
+                    "row_id": row_id,
+                    "report_period_end_dte": period_end_dte,
+                    "balance_sheet_schema": row_schema,
+                    "analizowany_okres": period,
+                    "relacja": f"Wartość ujemna niedozwolona: {col_key}",
+                    "rodzic": col_key,
+                    "wartosc_rodzica": val,
+                    "dzieci": [],
+                    "suma_dzieci": 0.0,
+                    "roznica": round(abs(val), 2),
+                    "roznica_procentowa": 100.0,
+                    "status": "FAIL",
+                })
 
-            if abs(diff_raw) <= tol_raw:
-                results.append(EquationCheck(
-                    period=period, equation=lhs_letter, lhs_col=lhs_col,
-                    expected=expected_raw, actual=lhs_value, diff=diff_raw,
-                    status="ok", corrected_cols=""
-                ))
-                continue
+        # --- TEST 2: Walidacja sum kontrolnych ---
+        def check_sum(parent_key: str, child_keys: List[str], label: str):
+            if not child_keys or parent_key not in data:
+                return
 
-            # --- PRÓBA 2: KOREKTA ZNAKU (abs() tylko na składnikach/kwotach) ---
-            # Pole wynikowe lhs_value nie jest modyfikowane przez abs()
-            expected_abs = sum(sign * abs(val) for sign, _, _, val in component_data)
-            diff_abs = lhs_value - expected_abs
-            tol_abs = max(tolerance_abs, tolerance_rel * abs(expected_abs))
+            parent_val = data.get(parent_key, 0.0)
+            children_vals = [data.get(k, 0.0) for k in child_keys]
+            children_val = sum(children_vals)
 
-            if abs(diff_abs) <= tol_abs:
-                # Rejestrujemy kolumny, w których wartość była ujemna i zmiana znaku naprawiła równanie
-                corrected = [col for _, _, col, val in component_data if val < 0]
-                results.append(EquationCheck(
-                    period=period, equation=lhs_letter, lhs_col=lhs_col,
-                    expected=expected_abs, actual=lhs_value, diff=diff_abs,
-                    status="ok_sign_corrected",
-                    corrected_cols=", ".join(corrected)
-                ))
-            else:
-                # Jeśli korekta znaku nie pomogła, zwracamy wynik z pierwotnej surowej próby
-                results.append(EquationCheck(
-                    period=period, equation=lhs_letter, lhs_col=lhs_col,
-                    expected=expected_raw, actual=lhs_value, diff=diff_raw,
-                    status="mismatch", corrected_cols=""
-                ))
+            diff = abs(parent_val - children_val)
+            max_val = max(abs(parent_val), abs(children_val))
 
-    return results
+            # Poprawiona tolerancja: wyższy z dwóch progów (sztywny bufor złoty vs mały % )
+            allowed_tolerance = max(abs_tolerance, max_val * rel_tolerance)
+            passed = diff <= allowed_tolerance
 
+            rel_diff = (diff / max_val * 100) if max_val > 0 else 0.0
 
-# ---------------------------------------------------------------------------
-# 4. AGREGACJA I RAPORTOOWANIE
-# ---------------------------------------------------------------------------
-
-def validate_income_statement(df: pd.DataFrame,
-                               id_cols=("krs", "report_id", "period_to"),
-                               tolerance_abs: float = 1.0,
-                               tolerance_rel: float = 0.0005) -> pd.DataFrame:
-    id_cols = [c for c in id_cols if c in df.columns]
-    rows_out = []
-
-    for _, row in df.iterrows():
-        structure = resolve_rzis_structure(row)
-        checks = check_row_equations(row, tolerance_abs, tolerance_rel)
-        for chk in checks:
-            rows_out.append({
-                **{c: row[c] for c in id_cols},
-                "rzis_structure": structure,
-                "period": chk.period,
-                "equation": chk.equation,
-                "expected": chk.expected,
-                "actual": chk.actual,
-                "diff": chk.diff,
-                "status": chk.status,
-                "corrected_cols": chk.corrected_cols,
+            results.append({
+                "row_id": row_id,
+                "report_period_end_dte": period_end_dte,
+                "balance_sheet_schema": row_schema,
+                "analizowany_okres": label.split()[0],
+                "relacja": label,
+                "rodzic": parent_key,
+                "wartosc_rodzica": parent_val,
+                "dzieci": child_keys,
+                "suma_dzieci": round(children_val, 2),
+                "roznica": round(diff, 2),
+                "roznica_procentowa": round(rel_diff, 2),
+                "status": "PASS" if passed else "FAIL",
             })
 
-    return pd.DataFrame(rows_out)
+        for period in periods:
+            # Poziom 0: Aktywa == Pasywa
+            akt_lvl0, pas_lvl0 = f"Aktywa_{period}", f"Pasywa_{period}"
+            if akt_lvl0 in data and pas_lvl0 in data:
+                check_sum(akt_lvl0, [pas_lvl0], f"{period} - Poziom 0: Aktywa == Pasywa")
 
+            # Poziom 1 i 2
+            for section in ["Aktywa", "Pasywa"]:
+                root = f"{section}_{period}"
+                pattern_lvl1 = pattern_lvl1_cache[section][period]
 
-def summarize_report_level(results: pd.DataFrame,
-                            id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame:
-    id_cols = [c for c in id_cols if c in results.columns]
+                lvl1_children = [k for k in data.keys() if pattern_lvl1.match(k)]
+                lvl1_children.sort(key=lambda x: pattern_lvl1.match(x).group(1))
 
-    def worst_status(s):
-        if (s == "mismatch").any():
-            return "mismatch"
-        if (s == "missing_data").any():
-            return "missing_data"
-        if (s == "unknown_structure").any():
-            return "unknown_structure"
-        if (s == "ok_sign_corrected").any():
-            return "ok_sign_corrected"
-        return "ok"
+                if lvl1_children:
+                    check_sum(root, lvl1_children, f"{period} - Poziom 1: {section} = sum(A..I)")
 
-    grouped = results.groupby(id_cols).agg(
-        rzis_structure=("rzis_structure", "first"),
-        n_equations=("equation", "count"),
-        n_mismatch=("status", lambda s: (s == "mismatch").sum()),
-        n_missing=("status", lambda s: (s == "missing_data").sum()),
-        n_sign_corrected=("status", lambda s: (s == "ok_sign_corrected").sum()),
-        max_abs_diff=("diff", lambda s: s.abs().max()),
-        report_status=("status", worst_status),
-    ).reset_index()
+                if skip_level2:
+                    continue
 
-    return grouped
+                for parent_lvl1 in lvl1_children:
+                    match = pattern_lvl1.match(parent_lvl1)
+                    if not match:
+                        continue
+                    letter = match.group(1)
 
+                    # Dynamiczna obsługa cyfr rzymskich i arabskich na Poziomie 2
+                    pattern_lvl2 = re.compile(
+                        rf"^{section}_{letter}_([IVXLCDM]+|\d+)_{period}$", re.IGNORECASE
+                    )
 
-def rejection_rate_by_structure(report_level: pd.DataFrame) -> pd.DataFrame:
-    return (
-        report_level
-        .groupby("rzis_structure")
-        .agg(
-            n_reports=("report_status", "size"),
-            n_mismatch=("report_status", lambda s: (s == "mismatch").sum()),
-            n_missing=("report_status", lambda s: (s == "missing_data").sum()),
-            n_sign_corrected=("report_status", lambda s: (s == "ok_sign_corrected").sum()),
-        )
-        .assign(
-            pct_mismatch=lambda d: (d["n_mismatch"] / d["n_reports"] * 100).round(1),
-            pct_sign_corrected=lambda d: (d["n_sign_corrected"] / d["n_reports"] * 100).round(1)
-        )
-        .sort_values("n_reports", ascending=False)
-    )
+                    lvl2_children = [k for k in data.keys() if pattern_lvl2.match(k)]
+                    if lvl2_children:
+                        check_sum(
+                            parent_lvl1,
+                            lvl2_children,
+                            f"{period} - Poziom 2: {section}_{letter} = sum(dzieci)"
+                        )
+
+    return pd.DataFrame(results)
