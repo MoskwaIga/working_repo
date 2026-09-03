@@ -1,23 +1,228 @@
+from dataclasses import dataclass
+from typing import Optional
+import pandas as pd
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# 1. RÓWNANIA PER STRUKTURA — na literach zgodnych z XML
+# ---------------------------------------------------------------------------
+RZIS_EQUATIONS = {
+    # Zał. 4 — mikro
+    ("mikro", None): [
+        ("F", [(+1, "A"), (-1, "B"), (+1, "C"), (-1, "D"), (-1, "E")]),
+        ("G", [(+1, "F")]),
+    ],
+
+    # Zał. 5 — mała, wariant porównawczy
+    ("mala", "porownawczy"): [
+        ("C", [(+1, "A"), (-1, "B")]),
+        ("H", [(+1, "C"), (+1, "D"), (-1, "E"), (+1, "F"), (-1, "G")]),
+        ("J", [(+1, "H"), (-1, "I")]),
+    ],
+
+    # Zał. 5 — mała, wariant kalkulacyjny
+    ("mala", "kalkulacyjny"): [
+        ("E", [(+1, "A"), (-1, "B"), (-1, "C"), (-1, "D")]),
+        ("J", [(+1, "E"), (+1, "F"), (-1, "G"), (+1, "H"), (-1, "I")]),
+        ("L", [(+1, "J"), (-1, "K")]),
+    ],
+
+    # Zał. 1 — inna, wariant porównawczy
+    ("inna", "porownawczy"): [
+        ("C", [(+1, "A"), (-1, "B")]),
+        ("F", [(+1, "C"), (+1, "D"), (-1, "E")]),
+        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
+        ("L", [(+1, "I"), (-1, "J"), (-1, "K")]),
+    ],
+
+    # Zał. 1 — inna, wariant kalkulacyjny
+    ("inna", "kalkulacyjny"): [
+        ("C", [(+1, "A"), (-1, "B")]),
+        ("F", [(+1, "C"), (-1, "D"), (-1, "E")]),
+        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
+        ("L", [(+1, "I"), (+1, "J"), (-1, "K")]),
+        ("O", [(+1, "L"), (-1, "M"), (-1, "N")]),
+    ],
+}
+
+
+# ---------------------------------------------------------------------------
+# 2. NAZEWNICTWO KOLUMN
+# ---------------------------------------------------------------------------
+COL_CURRENT = "{letter}_current"
+COL_PREVIOUS = "{letter}_previous"
+
+
+def _col(letter: str, period: str) -> str:
+    template = COL_CURRENT if period == "current" else COL_PREVIOUS
+    return template.format(letter=letter)
+
+
+# ---------------------------------------------------------------------------
+# 3. ROZPOZNANIE STRUKTURY
+# ---------------------------------------------------------------------------
+
+def _unit_from_schema(income_statement_schema) -> Optional[str]:
+    """Dopasowanie po podłańcuchu (działa dla RZiSInna oraz SprFinJednostkaInnaWZlotych)."""
+    if pd.isna(income_statement_schema):
+        return None
+    s = str(income_statement_schema).lower()
+    if "mikro" in s:
+        return "mikro"
+    if "mala" in s or "małą" in s or "mała" in s:
+        return "mala"
+    if "inna" in s:
+        return "inna"
+    return None
+
+
+def _variant_from_tag(income_statement_tag) -> Optional[str]:
+    if pd.isna(income_statement_tag):
+        return None
+    s = str(income_statement_tag).lower()
+    if "por" in s:
+        return "porownawczy"
+    if "kalk" in s:
+        return "kalkulacyjny"
+    return None
+
+
 def resolve_rzis_structure(row: pd.Series) -> Optional[tuple]:
     """
     Ustala klucz do RZIS_EQUATIONS na podstawie:
-      1. row["income_statement_schema"] -> np. "RZiSMala", "RZiSInna", "RZiSMikro"
-      2. Fallback: row["schema_type"] (np. "Inna", "JednostkaInna") gdy RZiS schema jest NaN
-      3. row["income_statement_tag"] -> "RZiSPor" / "RZiSKalk"
+      1. row["income_statement_schema"]
+      2. Fallback: row["schema_type"] gdy dedykowana schema RZiS to NaN
+      3. row["income_statement_tag"]
     """
-    # 1. Próba odczytu jednostki z dedykowanej kolumny RZiS
+    # 1. Odczyt z dedykowanej kolumny RZiS
     unit = _unit_from_schema(row.get("income_statement_schema"))
 
-    # 2. Fallback: jeśli dedykowana schema RZiS to NaN, użyj nagłówkowej schema_type
+    # 2. Fallback na nagłówek schema_type (np. SprFinJednostkaInnaWZlotych)
     if unit is None:
         unit = _unit_from_schema(row.get("schema_type"))
 
     if unit == "mikro":
         return ("mikro", None)
 
-    # 3. Określenie wariantu na podstawie tagu (porównawczy / kalkulacyjny)
     variant = _variant_from_tag(row.get("income_statement_tag"))
     if unit in ("mala", "inna") and variant in ("porownawczy", "kalkulacyjny"):
         return (unit, variant)
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# 4. WALIDACJA
+# ---------------------------------------------------------------------------
+
+@dataclass
+class EquationCheck:
+    period: str         # "current" / "previous"
+    equation: str       # litera wynikowa, np. "H"
+    lhs_col: str
+    expected: float
+    actual: float
+    diff: float
+    status: str         # "ok" / "mismatch" / "missing_data"
+
+
+def check_row_equations(row: pd.Series, tolerance_abs: float = 1.0,
+                         tolerance_rel: float = 0.0005) -> list:
+    structure = resolve_rzis_structure(row)
+    if structure is None:
+        return [EquationCheck("both", "structure", "-", np.nan, np.nan, np.nan, "unknown_structure")]
+
+    equations = RZIS_EQUATIONS[structure]
+    results = []
+
+    for period in ("current", "previous"):
+        for lhs_letter, components in equations:
+            lhs_col = _col(lhs_letter, period)
+            lhs_value = row.get(lhs_col, np.nan)
+            component_values = [(sign, row.get(_col(letter, period), np.nan))
+                                 for sign, letter in components]
+
+            if pd.isna(lhs_value) or any(pd.isna(v) for _, v in component_values):
+                results.append(EquationCheck(
+                    period=period, equation=lhs_letter, lhs_col=lhs_col,
+                    expected=np.nan, actual=lhs_value, diff=np.nan,
+                    status="missing_data",
+                ))
+                continue
+
+            expected = sum(sign * val for sign, val in component_values)
+            diff = lhs_value - expected
+            tol = max(tolerance_abs, tolerance_rel * abs(expected))
+            status = "ok" if abs(diff) <= tol else "mismatch"
+
+            results.append(EquationCheck(
+                period=period, equation=lhs_letter, lhs_col=lhs_col,
+                expected=expected, actual=lhs_value, diff=diff, status=status,
+            ))
+
+    return results
+
+
+def validate_income_statement(df: pd.DataFrame,
+                               id_cols=("krs", "report_id", "period_to"),
+                               tolerance_abs: float = 1.0,
+                               tolerance_rel: float = 0.0005) -> pd.DataFrame:
+    id_cols = [c for c in id_cols if c in df.columns]
+    rows_out = []
+
+    for _, row in df.iterrows():
+        structure = resolve_rzis_structure(row)
+        checks = check_row_equations(row, tolerance_abs, tolerance_rel)
+        for chk in checks:
+            rows_out.append({
+                **{c: row[c] for c in id_cols},
+                "rzis_structure": structure,
+                "period": chk.period,
+                "equation": chk.equation,
+                "expected": chk.expected,
+                "actual": chk.actual,
+                "diff": chk.diff,
+                "status": chk.status,
+            })
+
+    return pd.DataFrame(rows_out)
+
+
+def summarize_report_level(results: pd.DataFrame,
+                            id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame:
+    id_cols = [c for c in id_cols if c in results.columns]
+
+    def worst_status(s):
+        if (s == "mismatch").any():
+            return "mismatch"
+        if (s == "missing_data").any():
+            return "missing_data"
+        if (s == "unknown_structure").any():
+            return "unknown_structure"
+        return "ok"
+
+    grouped = results.groupby(id_cols).agg(
+        rzis_structure=("rzis_structure", "first"),
+        n_equations=("equation", "count"),
+        n_mismatch=("status", lambda s: (s == "mismatch").sum()),
+        n_missing=("status", lambda s: (s == "missing_data").sum()),
+        max_abs_diff=("diff", lambda s: s.abs().max()),
+        report_status=("status", worst_status),
+    ).reset_index()
+
+    return grouped
+
+
+def rejection_rate_by_structure(report_level: pd.DataFrame) -> pd.DataFrame:
+    return (
+        report_level
+        .groupby("rzis_structure")
+        .agg(
+            n_reports=("report_status", "size"),
+            n_mismatch=("report_status", lambda s: (s == "mismatch").sum()),
+            n_missing=("report_status", lambda s: (s == "missing_data").sum()),
+        )
+        .assign(pct_mismatch=lambda d: (d["n_mismatch"] / d["n_reports"] * 100).round(1))
+        .sort_values("n_reports", ascending=False)
+    )
