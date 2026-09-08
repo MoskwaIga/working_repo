@@ -1,41 +1,28 @@
-def summarize_report_level(results: pd.DataFrame,
-                            id_cols=("krs", "report_period_start_dte", "report_period_end_dte")) -> pd.DataFrame:
-    id_cols = [c for c in id_cols if c in results.columns]
-    core = results[results["equation"] != "E_vs_D"]
+def build_report_level_flags(df: pd.DataFrame, id_cols=ID_COLS) -> pd.DataFrame:
+    long_results = validate_cash_flow(df, id_cols=id_cols)
 
-    def worst_status(s):
-        if (s == "unknown_structure").any():
-            return "unknown_structure"
-        if (s == "forbidden_negative").any():
-            return "forbidden_negative"
-        if (s == "mismatch").any():
-            return "mismatch"
-        if (s == "missing_data").any():
-            return "missing_data"
-        return "ok"
+    if long_results.empty:
+        empty_df = df[id_cols].copy()
+        for col in ["is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna", "is_valid"]:
+            empty_df[col] = pd.Series([pd.NA] * len(df), dtype="boolean")
+        return empty_df
 
-    grouped = core.groupby(id_cols).agg(
-        rpp_structure=("rpp_structure", "first"),
-        n_equations=("equation", "count"),
-        n_mismatch=("status", lambda s: (s == "mismatch").sum()),
-        n_forbidden_negative=("status", lambda s: (s == "forbidden_negative").sum()),
-        n_missing=("status", lambda s: (s == "missing_data").sum()),
-        max_abs_diff=("diff", lambda s: s.abs().max()),
-        report_status=("status", worst_status),
-    ).reset_index()
+    summary = summarize_report_level(long_results, id_cols=id_cols)
+    is_unknown = summary["report_status"] == "unknown_structure"
 
-    # Bezpieczne wyliczanie bilansowa_zmiana_niespojna
-    e_vs_d_mask = results["equation"] == "E_vs_D"
-    if e_vs_d_mask.any():
-        e_vs_d = (results[e_vs_d_mask]
-                  .groupby(id_cols)["status"]
-                  .apply(lambda s: (s == "warning").any())
-                  .rename("bilansowa_zmiana_niespojna")
-                  .reset_index())
-        out = grouped.merge(e_vs_d, on=id_cols, how="left")
-    else:
-        out = grouped.copy()
-        out["bilansowa_zmiana_niespojna"] = pd.Series([pd.NA] * len(out), dtype="boolean")
+    # Zabezpieczenie na poziomie podsumowania
+    if "bilansowa_zmiana_niespojna" not in summary.columns:
+        summary["bilansowa_zmiana_niespojna"] = pd.Series([pd.NA] * len(summary), dtype="boolean")
 
-    out["bilansowa_zmiana_niespojna"] = out["bilansowa_zmiana_niespojna"].astype("boolean")
-    return out
+    is_valid_sums = (summary["n_mismatch"] == 0).astype("boolean").mask(is_unknown, pd.NA)
+    has_forbidden_neg = (summary["n_forbidden_negative"] > 0).astype("boolean").mask(is_unknown, pd.NA)
+    bilansowa_niespojna = summary["bilansowa_zmiana_niespojna"].astype("boolean").mask(is_unknown, pd.NA)
+
+    is_valid = is_valid_sums & (~has_forbidden_neg)
+
+    summary["is_valid_sums"] = is_valid_sums
+    summary["has_forbidden_negative"] = has_forbidden_neg
+    summary["bilansowa_zmiana_niespojna"] = bilansowa_niespojna
+    summary["is_valid"] = is_valid
+
+    return summary[id_cols + ["is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna", "is_valid"]]
