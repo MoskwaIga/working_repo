@@ -1,69 +1,237 @@
 """
-Buduje data/stage/income_statement_cor.parquet: oryginalna tabela
-income_statement + flagi walidacyjne per raport.
-
-### KONFIG - dostosuj do swojego pipeline'u ###
+Walidacja równań RZiS zintegrowana ze ścisłą kontrolą wartości ujemnych.
 """
-from pathlib import Path
+
+from dataclasses import dataclass
+from typing import Optional, List
 import pandas as pd
-
-from validate_income_statement import validate_income_statement
-from common import months_between
-
-INPUT_PATH = "data/stage/income_statement.parquet"        # <- ZMIEN jesli inna
-OUTPUT_PATH = "data/stage/income_statement_cor.parquet"
-ID_COL = "report_id"
-START_COL = "report_period_start_dte"
-END_COL = "report_period_end_dte"
+import numpy as np
 
 
+RZIS_EQUATIONS = {
+    ("mikro", None): [
+        ("F", [(+1, "A"), (-1, "B"), (+1, "C"), (-1, "D"), (-1, "E")]),
+        ("G", [(+1, "F")]),
+    ],
+    ("mala", "porownawczy"): [
+        ("C", [(+1, "A"), (-1, "B")]),
+        ("H", [(+1, "C"), (+1, "D"), (-1, "E"), (+1, "F"), (-1, "G")]),
+        ("J", [(+1, "H"), (-1, "I")]),
+    ],
+    ("mala", "kalkulacyjny"): [
+        ("E", [(+1, "A"), (-1, "B"), (-1, "C"), (-1, "D")]),
+        ("J", [(+1, "E"), (+1, "F"), (-1, "G"), (+1, "H"), (-1, "I")]),
+        ("L", [(+1, "J"), (-1, "K")]),
+    ],
+    ("inna", "porownawczy"): [
+        ("C", [(+1, "A"), (-1, "B")]),
+        ("F", [(+1, "C"), (+1, "D"), (-1, "E")]),
+        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
+        ("L", [(+1, "I"), (-1, "J"), (-1, "K")]),
+    ],
+    ("inna", "kalkulacyjny"): [
+        ("C", [(+1, "A"), (-1, "B")]),
+        ("F", [(+1, "C"), (-1, "D"), (-1, "E")]),
+        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
+        ("L", [(+1, "I"), (+1, "J"), (-1, "K")]),
+        ("O", [(+1, "L"), (-1, "M"), (-1, "N")]),
+    ],
+}
+
+
+def is_forbidden_negative_rzis(letter: str, structure: tuple) -> bool:
+    """
+    Reguła biznesowa RZiS:
+    - Pozycje wyników (LHS w równaniach, np. Zysk/Strata ze sprzedaży, brutto, netto) 
+      MOGĄ być ujemne (zwraca False).
+    - Surowe przychody, koszty i podatek dochodowy NIE MOGĄ być ujemne (zwraca True).
+    """
+    equations = RZIS_EQUATIONS.get(structure, [])
+    lhs_letters = {eq[0] for eq in equations}
+
+    # Jeśli litera jest wynikiem równania -> może być ujemna (strata)
+    if letter in lhs_letters:
+        return False
+
+    # Wszystkie pozostałe pozycje (przychody, koszty, podatek) muszą być >= 0
+    return True
+
+
+COL_CURRENT = "{letter}_current"
+COL_PREVIOUS = "{letter}_previous"
+
+
+def _col(letter: str, period: str) -> str:
+    template = COL_CURRENT if period == "current" else COL_PREVIOUS
+    return template.format(letter=letter)
+
+
+def _unit_from_schema(income_statement_schema) -> Optional[str]:
+    if pd.isna(income_statement_schema):
+        return None
+    s = str(income_statement_schema).lower()
+    if "mikro" in s:
+        return "mikro"
+    if "mala" in s or "małą" in s or "mała" in s:
+        return "mala"
+    if "inna" in s:
+        return "inna"
+    return None
+
+
+def _variant_from_tag(income_statement_tag) -> Optional[str]:
+    if pd.isna(income_statement_tag):
+        return None
+    s = str(income_statement_tag).lower()
+    if "por" in s:
+        return "porownawczy"
+    if "kalk" in s:
+        return "kalkulacyjny"
+    return None
+
+
+def resolve_rzis_structure(row: pd.Series) -> Optional[tuple]:
+    unit = _unit_from_schema(row.get("income_statement_schema"))
+    if unit == "mikro":
+        return ("mikro", None)
+    variant = _variant_from_tag(row.get("income_statement_tag"))
+    if unit in ("mala", "inna") and variant in ("porownawczy", "kalkulacyjny"):
+        return (unit, variant)
+    return None
+
+
+@dataclass
+class EquationCheck:
+    period: str
+    equation: str
+    lhs_col: str
+    expected: float
+    actual: float
+    diff: float
+    status: str  # "ok" / "mismatch" / "forbidden_negative" / "missing_data" / "unknown_structure"
+    has_forbidden_negative: bool = False
+
+
+def check_row_equations(row: pd.Series, tolerance_abs: float = 1.0,
+                         tolerance_rel: float = 0.0005) -> List[EquationCheck]:
+    structure = resolve_rzis_structure(row)
+    if structure is None:
+        return [EquationCheck("both", "structure", "-", np.nan, np.nan, np.nan, "unknown_structure")]
+
+    equations = RZIS_EQUATIONS[structure]
+    
+    # Wszystkie litery występujące w danym schemacie
+    all_letters = set()
+    for lhs, components in equations:
+        all_letters.add(lhs)
+        all_letters.update(letter for _, letter in components)
+
+    results = []
+
+    for period in ("current", "previous"):
+        # 1. Walidacja równań matematycznych
+        for lhs_letter, components in equations:
+            lhs_col = _col(lhs_letter, period)
+            lhs_value = row.get(lhs_col, np.nan)
+            component_values = [(sign, row.get(_col(letter, period), np.nan))
+                                 for sign, letter in components]
+
+            if pd.isna(lhs_value) or any(pd.isna(v) for _, v in component_values):
+                results.append(EquationCheck(period, lhs_letter, lhs_col,
+                                              np.nan, lhs_value, np.nan, "missing_data"))
+                continue
+
+            expected = sum(sign * val for sign, val in component_values)
+            diff = lhs_value - expected
+            tol = max(tolerance_abs, tolerance_rel * abs(expected))
+            status = "ok" if abs(diff) <= tol else "mismatch"
+            results.append(EquationCheck(period, lhs_letter, lhs_col, expected, lhs_value, diff, status))
+
+        # 2. Walidacja zakazanych wartości ujemnych
+        for letter in all_letters:
+            col = _col(letter, period)
+            val = row.get(col, np.nan)
+            
+            if pd.isna(val):
+                continue
+                
+            if val < 0 and is_forbidden_negative_rzis(letter, structure):
+                results.append(EquationCheck(
+                    period=period, 
+                    equation=f"NoNegative_{letter}", 
+                    lhs_col=col,
+                    expected=0.0, 
+                    actual=val, 
+                    diff=val, 
+                    status="forbidden_negative", 
+                    has_forbidden_negative=True
+                ))
+
+    return results
+
+
+def validate_income_statement(df: pd.DataFrame,
+                               id_cols=("krs", "report_id", "period_to"),
+                               tolerance_abs: float = 1.0,
+                               tolerance_rel: float = 0.0005) -> pd.DataFrame:
+    id_cols = [c for c in id_cols if c in df.columns]
+    rows_out = []
+    for _, row in df.iterrows():
+        structure = resolve_rzis_structure(row)
+        for chk in check_row_equations(row, tolerance_abs, tolerance_rel):
+            rows_out.append({
+                **{c: row[c] for c in id_cols},
+                "rzis_structure": str(structure) if structure else "unknown",
+                "period": chk.period,
+                "equation": chk.equation,
+                "expected": chk.expected,
+                "actual": chk.actual,
+                "diff": chk.diff,
+                "status": chk.status,
+                "has_forbidden_negative": chk.has_forbidden_negative,
+            })
+    return pd.DataFrame(rows_out)
+
+
+def summarize_report_level(results: pd.DataFrame,
+                           id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame:
+    id_cols = [c for c in id_cols if c in results.columns]
+
+    def worst_status(s):
+        if (s == "unknown_structure").any():
+            return "unknown_structure"
+        if (s == "forbidden_negative").any():
+            return "forbidden_negative"
+        if (s == "mismatch").any():
+            return "mismatch"
+        if (s == "missing_data").any():
+            return "missing_data"
+        return "ok"
+
+    return results.groupby(id_cols).agg(
+        rzis_structure=("rzis_structure", "first"),
+        n_equations=("equation", "count"),
+        n_mismatch=("status", lambda s: (s == "mismatch").sum()),
+        n_forbidden_negative=("status", lambda s: (s == "forbidden_negative").sum()),
+        max_abs_diff=("diff", lambda s: s.abs().max()),
+        report_status=("status", worst_status),
+    ).reset_index()
+-----------------
 def build_report_level_flags(df: pd.DataFrame, id_col: str = ID_COL) -> pd.DataFrame:
     long_results = validate_income_statement(df, id_cols=(id_col,))
 
     if long_results.empty:
-        return pd.DataFrame({id_col: df[id_col], "is_valid_sums": pd.NA,
-                              "has_forbidden_negative": pd.NA})
+        return pd.DataFrame({
+            id_col: df[id_col],
+            "is_valid_sums": pd.Series([pd.NA] * len(df), dtype="boolean"),
+            "has_forbidden_negative": pd.Series([pd.NA] * len(df), dtype="boolean")
+        })
 
-    def report_validity(s: pd.Series) -> object:
-        if (s == "unknown_structure").any():
-            return pd.NA  # nierozpoznana struktura RZiS -> nie wiadomo, nie zgadujemy
-        return not (s == "mismatch").any()
+    summary = summarize_report_level(long_results, id_cols=(id_col,))
+    is_unknown = summary["report_status"] == "unknown_structure"
 
-    is_valid = (
-        long_results.groupby(id_col)["status"]
-        .apply(report_validity)
-        .rename("is_valid_sums")
-    )
-    negatives = (
-        long_results.groupby(id_col)["has_forbidden_negative"]
-        .any()
-        .rename("has_forbidden_negative")
-    )
+    # Jeśli wystąpiła choć jedna zakazana ujemna wartość -> has_forbidden_negative = True (1)
+    summary["is_valid_sums"] = (summary["n_mismatch"] == 0).astype("boolean").mask(is_unknown, pd.NA)
+    summary["has_forbidden_negative"] = (summary["n_forbidden_negative"] > 0).astype("boolean").mask(is_unknown, pd.NA)
 
-    flags = pd.concat([is_valid, negatives], axis=1).reset_index()
-    flags["is_valid_sums"] = flags["is_valid_sums"].astype("boolean")
-    flags["has_forbidden_negative"] = flags["has_forbidden_negative"].astype("boolean")
-    return flags
-
-
-def build(df: pd.DataFrame) -> pd.DataFrame:
-    flags = build_report_level_flags(df)
-    out = df.merge(flags, on=ID_COL, how="left")
-    out["is_valid_sums"] = out["is_valid_sums"].astype("boolean")
-    out["has_forbidden_negative"] = out["has_forbidden_negative"].astype("boolean")
-    out["report_period_months"] = out.apply(
-        lambda r: months_between(r[START_COL], r[END_COL]), axis=1
-    )
-    return out
-
-
-if __name__ == "__main__":
-    df_in = pd.read_parquet(INPUT_PATH)
-    df_out = build(df_in)
-
-    out_path = Path(OUTPUT_PATH)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_parquet(out_path, index=False)
-
-    print(f"Zapisano {len(df_out)} wierszy -> {out_path}")
-    print(df_out[["is_valid_sums", "has_forbidden_negative"]].value_counts(dropna=False))
+    return summary[[id_col, "is_valid_sums", "has_forbidden_negative"]]
