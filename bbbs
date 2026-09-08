@@ -1,48 +1,56 @@
+"""
+Buduje data/stage/income_statement_cor.parquet: oryginalna tabela
+income_statement + flagi walidacyjne per raport.
+
+### KONFIG - dostosuj do swojego pipeline'u ###
+"""
 from pathlib import Path
 import pandas as pd
 
-# Importujemy nowe funkcje z zaktualizowanego modułu
-from validate_balance_sheet import validate_balance_sheet, summarize_report_level
+from validate_income_statement import validate_income_statement
 from common import months_between
 
-# --- KONFIG: dostosuj sciezki i nazwy kolumn do swoich danych ---
-INPUT_PATH = "data/stage/balance_sheet.parquet"
-OUTPUT_PATH = "data/stage/balance_sheet_cor.parquet"
+INPUT_PATH = "data/stage/income_statement.parquet"        # <- ZMIEN jesli inna
+OUTPUT_PATH = "data/stage/income_statement_cor.parquet"
 ID_COL = "report_id"
 START_COL = "report_period_start_dte"
 END_COL = "report_period_end_dte"
 
 
 def build_report_level_flags(df: pd.DataFrame, id_col: str = ID_COL) -> pd.DataFrame:
-    """Zwraca DataFrame [id_col, is_valid_sums, has_forbidden_negative] wyliczony 
-    za pomocą funkcji podsumowującej z modułu walidacji."""
-    long_results = validate_balance_sheet(df, id_cols=(id_col,))
+    long_results = validate_income_statement(df, id_cols=(id_col,))
 
     if long_results.empty:
-        return pd.DataFrame({
-            id_col: df[id_col],
-            "is_valid_sums": pd.Series([pd.NA] * len(df), dtype="boolean"),
-            "has_forbidden_negative": pd.Series([pd.NA] * len(df), dtype="boolean")
-        })
+        return pd.DataFrame({id_col: df[id_col], "is_valid_sums": pd.NA,
+                              "has_forbidden_negative": pd.NA})
 
-    # Korzystamy z gotowej agregacji z modułu walidacyjnego
-    summary = summarize_report_level(long_results, id_cols=(id_col,))
+    def report_validity(s: pd.Series) -> object:
+        if (s == "unknown_structure").any():
+            return pd.NA  # nierozpoznana struktura RZiS -> nie wiadomo, nie zgadujemy
+        return not (s == "mismatch").any()
 
-    # Mapujemy zagregowane zliczenia na flagi logiczne
-    summary["is_valid_sums"] = (summary["n_mismatch"] == 0).astype("boolean")
-    summary["has_forbidden_negative"] = (summary["n_forbidden_negative"] > 0).astype("boolean")
+    is_valid = (
+        long_results.groupby(id_col)["status"]
+        .apply(report_validity)
+        .rename("is_valid_sums")
+    )
+    negatives = (
+        long_results.groupby(id_col)["has_forbidden_negative"]
+        .any()
+        .rename("has_forbidden_negative")
+    )
 
-    return summary[[id_col, "is_valid_sums", "has_forbidden_negative"]]
+    flags = pd.concat([is_valid, negatives], axis=1).reset_index()
+    flags["is_valid_sums"] = flags["is_valid_sums"].astype("boolean")
+    flags["has_forbidden_negative"] = flags["has_forbidden_negative"].astype("boolean")
+    return flags
 
 
 def build(df: pd.DataFrame) -> pd.DataFrame:
     flags = build_report_level_flags(df)
-
     out = df.merge(flags, on=ID_COL, how="left")
-    
     out["is_valid_sums"] = out["is_valid_sums"].astype("boolean")
     out["has_forbidden_negative"] = out["has_forbidden_negative"].astype("boolean")
-
     out["report_period_months"] = out.apply(
         lambda r: months_between(r[START_COL], r[END_COL]), axis=1
     )
