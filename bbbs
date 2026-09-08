@@ -1,196 +1,71 @@
 """
-Walidacja równań Rachunku Przepływów Pieniężnych (RPP) w ujednoliconym standardzie.
+Buduje data/stage/cash_flow_cor.parquet: oryginalna tabela cash_flow +
+flagi walidacyjne per raport, w tym głowna flaga is_valid.
 """
-
-from dataclasses import dataclass
-from typing import Optional, List
+from pathlib import Path
 import pandas as pd
-import numpy as np
+
+from validate_cash_flow import validate_cash_flow, summarize_report_level
+from common import months_between
+
+INPUT_PATH = "data/stage/cash_flow.parquet"
+OUTPUT_PATH = "data/stage/cash_flow_cor.parquet"
+ID_COL = "report_id"
+START_COL = "report_period_start_dte"
+END_COL = "report_period_end_dte"
 
 
-RPP_EQUATIONS = {
-    "bezposrednia": [
-        ("A_III", [(+1, "A_I"), (-1, "A_II")]),
-        ("B_III", [(+1, "B_I"), (-1, "B_II")]),
-        ("C_III", [(+1, "C_I"), (-1, "C_II")]),
-        ("D", [(+1, "A_III"), (+1, "B_III"), (+1, "C_III")]),
-        ("G", [(+1, "F"), (+1, "D")]),
-    ],
-    "posrednia": [
-        ("A_III", [(+1, "A_I"), (+1, "A_II")]),
-        ("B_III", [(+1, "B_I"), (-1, "B_II")]),
-        ("C_III", [(+1, "C_I"), (-1, "C_II")]),
-        ("D", [(+1, "A_III"), (+1, "B_III"), (+1, "C_III")]),
-        ("G", [(+1, "F"), (+1, "D")]),
-    ],
-}
+def build_report_level_flags(df: pd.DataFrame, id_col: str = ID_COL) -> pd.DataFrame:
+    long_results = validate_cash_flow(df, id_cols=(id_col,))
 
-FORBIDDEN_NEGATIVE_LETTERS = {
-    "bezposrednia": {"A_I", "A_II", "B_I", "B_II", "C_I", "C_II", "F", "G"},
-    "posrednia": {"B_I", "B_II", "C_I", "C_II", "F", "G"},
-}
+    if long_results.empty:
+        return pd.DataFrame({
+            id_col: df[id_col],
+            "is_valid_sums": pd.Series([pd.NA] * len(df), dtype="boolean"),
+            "has_forbidden_negative": pd.Series([pd.NA] * len(df), dtype="boolean"),
+            "bilansowa_zmiana_niespojna": pd.Series([pd.NA] * len(df), dtype="boolean"),
+            "is_valid": pd.Series([pd.NA] * len(df), dtype="boolean"),
+        })
 
+    summary = summarize_report_level(long_results, id_cols=(id_col,))
+    is_unknown = summary["report_status"] == "unknown_structure"
 
-COL_CURRENT = "{letter}_current"
-COL_PREVIOUS = "{letter}_previous"
+    # Wyliczanie poszczególnych flag
+    is_valid_sums = (summary["n_mismatch"] == 0).astype("boolean").mask(is_unknown, pd.NA)
+    has_forbidden_neg = (summary["n_forbidden_negative"] > 0).astype("boolean").mask(is_unknown, pd.NA)
+    bilansowa_niespojna = summary["bilansowa_zmiana_niespojna"].astype("boolean").mask(is_unknown, pd.NA)
 
+    # Główna flaga is_valid (musi zgadzać się suma oraz nie być wartości zakazanych)
+    is_valid = is_valid_sums & (~has_forbidden_neg)
 
-def _col(letter: str, period: str) -> str:
-    template = COL_CURRENT if period == "current" else COL_PREVIOUS
-    return template.format(letter=letter)
+    summary["is_valid_sums"] = is_valid_sums
+    summary["has_forbidden_negative"] = has_forbidden_neg
+    summary["bilansowa_zmiana_niespojna"] = bilansowa_niespojna
+    summary["is_valid"] = is_valid
 
-
-def _method_from_tag(cash_flow_method) -> Optional[str]:
-    if pd.isna(cash_flow_method):
-        return None
-    s = str(cash_flow_method).lower()
-    if "bezp" in s:
-        return "bezposrednia"
-    if "posr" in s or "pośr" in s:
-        return "posrednia"
-    return None
+    return summary[[id_col, "is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna", "is_valid"]]
 
 
-def resolve_rpp_structure(row: pd.Series) -> Optional[str]:
-    return _method_from_tag(row.get("cash_flow_method"))
-
-
-@dataclass
-class EquationCheck:
-    period: str
-    equation: str
-    lhs_col: str
-    expected: float
-    actual: float
-    diff: float
-    status: str   # "ok" / "mismatch" / "missing_data" / "warning" / "forbidden_negative" / "unknown_structure"
-    has_forbidden_negative: bool = False
-
-
-def check_row_rpp(row: pd.Series, tolerance_abs: float = 1.0,
-                   tolerance_rel: float = 0.0005) -> List[EquationCheck]:
-    structure = resolve_rpp_structure(row)
-    if structure is None:
-        return [EquationCheck("both", "structure", "-", np.nan, np.nan, np.nan, "unknown_structure")]
-
-    equations = RPP_EQUATIONS[structure]
-    results = []
-
-    for period in ("current", "previous"):
-        # 1. Walidacja równań
-        for lhs_letter, components in equations:
-            lhs_col = _col(lhs_letter, period)
-            lhs_value = row.get(lhs_col, np.nan)
-            component_values = [(sign, row.get(_col(letter, period), np.nan))
-                                 for sign, letter in components]
-
-            if pd.isna(lhs_value) or any(pd.isna(v) for _, v in component_values):
-                results.append(EquationCheck(
-                    period=period, equation=lhs_letter, lhs_col=lhs_col,
-                    expected=np.nan, actual=lhs_value, diff=np.nan,
-                    status="missing_data",
-                ))
-                continue
-
-            expected = sum(sign * val for sign, val in component_values)
-            diff = lhs_value - expected
-            tol = max(tolerance_abs, tolerance_rel * abs(expected))
-            status = "ok" if abs(diff) <= tol else "mismatch"
-
-            results.append(EquationCheck(
-                period=period, equation=lhs_letter, lhs_col=lhs_col,
-                expected=expected, actual=lhs_value, diff=diff, status=status,
-            ))
-
-        # 2. Miękki check: E (bilansowa zmiana) vs D (przepływy netto razem)
-        d_val = row.get(_col("D", period), np.nan)
-        e_val = row.get(_col("E", period), np.nan)
-        if pd.isna(d_val) or pd.isna(e_val):
-            results.append(EquationCheck(period, "E_vs_D", _col("E", period),
-                                          d_val, e_val, np.nan, "missing_data"))
-        else:
-            diff = e_val - d_val
-            tol = max(tolerance_abs, tolerance_rel * abs(d_val))
-            status = "ok" if abs(diff) <= tol else "warning"
-            results.append(EquationCheck(period, "E_vs_D", _col("E", period),
-                                          d_val, e_val, diff, status))
-
-        # 3. Niedozwolone wartości ujemne
-        for letter in FORBIDDEN_NEGATIVE_LETTERS[structure]:
-            col = _col(letter, period)
-            val = row.get(col, np.nan)
-            if pd.isna(val):
-                continue
-            if val < 0:
-                results.append(EquationCheck(
-                    period=period, 
-                    equation=f"negative_{letter}", 
-                    lhs_col=col,
-                    expected=0.0, 
-                    actual=val, 
-                    diff=val, 
-                    status="forbidden_negative", 
-                    has_forbidden_negative=True
-                ))
-
-    return results
-
-
-def validate_cash_flow(df: pd.DataFrame,
-                        id_cols=("krs", "report_id", "period_to"),
-                        tolerance_abs: float = 1.0,
-                        tolerance_rel: float = 0.0005) -> pd.DataFrame:
-    id_cols = [c for c in id_cols if c in df.columns]
-    rows_out = []
-    for _, row in df.iterrows():
-        structure = resolve_rpp_structure(row)
-        for chk in check_row_rpp(row, tolerance_abs, tolerance_rel):
-            rows_out.append({
-                **{c: row[c] for c in id_cols},
-                "rpp_structure": structure if structure else "unknown",
-                "period": chk.period,
-                "equation": chk.equation,
-                "expected": chk.expected,
-                "actual": chk.actual,
-                "diff": chk.diff,
-                "status": chk.status,
-                "has_forbidden_negative": chk.has_forbidden_negative,
-            })
-    return pd.DataFrame(rows_out)
-
-
-def summarize_report_level(results: pd.DataFrame,
-                            id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame:
-    id_cols = [c for c in id_cols if c in results.columns]
-    core = results[results["equation"] != "E_vs_D"]
-
-    def worst_status(s):
-        if (s == "unknown_structure").any():
-            return "unknown_structure"
-        if (s == "forbidden_negative").any():
-            return "forbidden_negative"
-        if (s == "mismatch").any():
-            return "mismatch"
-        if (s == "missing_data").any():
-            return "missing_data"
-        return "ok"
-
-    grouped = core.groupby(id_cols).agg(
-        rpp_structure=("rpp_structure", "first"),
-        n_equations=("equation", "count"),
-        n_mismatch=("status", lambda s: (s == "mismatch").sum()),
-        n_forbidden_negative=("status", lambda s: (s == "forbidden_negative").sum()),
-        n_missing=("status", lambda s: (s == "missing_data").sum()),
-        max_abs_diff=("diff", lambda s: s.abs().max()),
-        report_status=("status", worst_status),
-    ).reset_index()
-
-    e_vs_d = (results[results["equation"] == "E_vs_D"]
-              .groupby(id_cols)["status"]
-              .apply(lambda s: (s == "warning").any())
-              .rename("bilansowa_zmiana_niespojna")
-              .reset_index())
-
-    out = grouped.merge(e_vs_d, on=id_cols, how="left")
-    out["bilansowa_zmiana_niespojna"] = out["bilansowa_zmiana_niespojna"].astype("boolean")
+def build(df: pd.DataFrame) -> pd.DataFrame:
+    flags = build_report_level_flags(df)
+    out = df.merge(flags, on=ID_COL, how="left")
+    
+    for c in ["is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna", "is_valid"]:
+        out[c] = out[c].astype("boolean")
+        
+    out["report_period_months"] = out.apply(
+        lambda r: months_between(r[START_COL], r[END_COL]), axis=1
+    )
     return out
+
+
+if __name__ == "__main__":
+    df_in = pd.read_parquet(INPUT_PATH)
+    df_out = build(df_in)
+
+    out_path = Path(OUTPUT_PATH)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_parquet(out_path, index=False)
+
+    print(f"Zapisano {len(df_out)} wierszy -> {out_path}")
+    print(df_out[["is_valid", "is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna"]].value_counts(dropna=False))
