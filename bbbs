@@ -1,38 +1,41 @@
-def build_report_level_flags(df: pd.DataFrame, id_cols=ID_COLS) -> pd.DataFrame:
-    # Walidacja przekazuje całą listę kolumn jako klucz
-    long_results = validate_cash_flow(df, id_cols=id_cols)  # odpowiednio: validate_balance_sheet / validate_income_statement
+def summarize_report_level(results: pd.DataFrame,
+                            id_cols=("krs", "report_period_start_dte", "report_period_end_dte")) -> pd.DataFrame:
+    id_cols = [c for c in id_cols if c in results.columns]
+    core = results[results["equation"] != "E_vs_D"]
 
-    if long_results.empty:
-        empty_df = df[id_cols].copy()
-        for col in ["is_valid_sums", "has_forbidden_negative", "is_valid"]:
-            empty_df[col] = pd.Series([pd.NA] * len(df), dtype="boolean")
-        return empty_df
+    def worst_status(s):
+        if (s == "unknown_structure").any():
+            return "unknown_structure"
+        if (s == "forbidden_negative").any():
+            return "forbidden_negative"
+        if (s == "mismatch").any():
+            return "mismatch"
+        if (s == "missing_data").any():
+            return "missing_data"
+        return "ok"
 
-    summary = summarize_report_level(long_results, id_cols=id_cols)
-    is_unknown = summary["report_status"] == "unknown_structure"
+    grouped = core.groupby(id_cols).agg(
+        rpp_structure=("rpp_structure", "first"),
+        n_equations=("equation", "count"),
+        n_mismatch=("status", lambda s: (s == "mismatch").sum()),
+        n_forbidden_negative=("status", lambda s: (s == "forbidden_negative").sum()),
+        n_missing=("status", lambda s: (s == "missing_data").sum()),
+        max_abs_diff=("diff", lambda s: s.abs().max()),
+        report_status=("status", worst_status),
+    ).reset_index()
 
-    is_valid_sums = (summary["n_mismatch"] == 0).astype("boolean").mask(is_unknown, pd.NA)
-    has_forbidden_neg = (summary["n_forbidden_negative"] > 0).astype("boolean").mask(is_unknown, pd.NA)
-    is_valid = is_valid_sums & (~has_forbidden_neg)
+    # Bezpieczne wyliczanie bilansowa_zmiana_niespojna
+    e_vs_d_mask = results["equation"] == "E_vs_D"
+    if e_vs_d_mask.any():
+        e_vs_d = (results[e_vs_d_mask]
+                  .groupby(id_cols)["status"]
+                  .apply(lambda s: (s == "warning").any())
+                  .rename("bilansowa_zmiana_niespojna")
+                  .reset_index())
+        out = grouped.merge(e_vs_d, on=id_cols, how="left")
+    else:
+        out = grouped.copy()
+        out["bilansowa_zmiana_niespojna"] = pd.Series([pd.NA] * len(out), dtype="boolean")
 
-    summary["is_valid_sums"] = is_valid_sums
-    summary["has_forbidden_negative"] = has_forbidden_neg
-    summary["is_valid"] = is_valid
-
-    # Zwracamy podane kolumny kluczowe oraz wyliczone flagi
-    return summary[id_cols + ["is_valid_sums", "has_forbidden_negative", "is_valid"]]
-
-
-def build(df: pd.DataFrame) -> pd.DataFrame:
-    flags = build_report_level_flags(df, id_cols=ID_COLS)
-    
-    # Merge po zespole 3 kolumn
-    out = df.merge(flags, on=ID_COLS, how="left")
-    
-    for c in ["is_valid_sums", "has_forbidden_negative", "is_valid"]:
-        out[c] = out[c].astype("boolean")
-        
-    out["report_period_months"] = out.apply(
-        lambda r: months_between(r[START_COL], r[END_COL]), axis=1
-    )
+    out["bilansowa_zmiana_niespojna"] = out["bilansowa_zmiana_niespojna"].astype("boolean")
     return out
