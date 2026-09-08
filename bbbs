@@ -1,34 +1,72 @@
-"""Wspolne funkcje pomocnicze dla skryptow budujacych tabele *_cor."""
+"""
+Buduje data/stage/balance_sheet_cor.parquet: oryginalna tabela balance_sheet
++ flagi walidacyjne per raport.
 
-import calendar
+### KONFIG - dostosuj do swojego pipeline'u ###
+"""
+from pathlib import Path
 import pandas as pd
-import numpy as np
+
+from validate_balance_sheet import validate_balance_sheet_df
+from common import months_between
+
+# --- KONFIG: dostosuj sciezki i nazwy kolumn do swoich danych ---
+INPUT_PATH = "data/stage/balance_sheet.parquet"          # <- ZMIEN jesli inna
+OUTPUT_PATH = "data/stage/balance_sheet_cor.parquet"
+ID_COL = "report_id"                                       # <- unikalny klucz raportu
+START_COL = "report_period_start_dte"
+END_COL = "report_period_end_dte"
 
 
-def months_between(start, end):
-    """
-    Liczba pelnych miesiecy okresu obrotowego [start, end] (oba konce
-    wlacznie - tak jak raportowane 'report_period_start_dte' /
-    'report_period_end_dte', np. 2021-01-01 -> 2021-12-31 = 12).
+def build_report_level_flags(df: pd.DataFrame, id_col: str = ID_COL) -> pd.DataFrame:
+    """Zwraca DataFrame [id_col, is_valid_sums, has_forbidden_negative] - jeden
+    wiersz na raport, wyliczony z 'dlugiej' tabeli wynikow walidacji."""
+    long_results = validate_balance_sheet_df(df, id_cols=(id_col,))
 
-    Dziala poprawnie dla typowego przypadku (start = 1. dzien miesiaca,
-    end = ostatni dzien miesiaca -> np. skrocony pierwszy rok dzialalnosci,
-    polrocze, okres po polaczeniu spolek itp.) - wtedy liczy pelne miesiace
-    kalendarzowe. W przeciwnym razie (np. daty "krzywe", nie na granicy
-    miesiaca) liczy w przyblizeniu na podstawie liczby dni (30.44 dnia/mies.,
-    zaokraglone) - takie wiersze warto pozniej przejrzec recznie.
-    """
-    if pd.isna(start) or pd.isna(end):
-        return np.nan
+    if long_results.empty:
+        return pd.DataFrame({id_col: df[id_col], "is_valid_sums": pd.NA,
+                              "has_forbidden_negative": pd.NA})
 
-    start = pd.Timestamp(start)
-    end = pd.Timestamp(end)
+    sums = long_results[long_results["check_type"] != "negative_value"]
+    is_valid = (
+        sums.groupby(id_col)["status"]
+        .apply(lambda s: not (s == "fail").any())
+        .rename("is_valid_sums")
+    )
 
-    calendar_months = (end.year - start.year) * 12 + (end.month - start.month)
-    end_is_last_day = end.day == calendar.monthrange(end.year, end.month)[1]
+    negatives = (
+        long_results.groupby(id_col)["has_forbidden_negative"]
+        .any()
+        .rename("has_forbidden_negative")
+    )
 
-    if start.day == 1 and end_is_last_day:
-        return int(calendar_months + 1)
+    flags = pd.concat([is_valid, negatives], axis=1).reset_index()
+    flags["is_valid_sums"] = flags["is_valid_sums"].astype("boolean")
+    flags["has_forbidden_negative"] = flags["has_forbidden_negative"].astype("boolean")
+    return flags
 
-    # fallback dla dat nie lezacych na granicy miesiaca
-    return int(round((end - start).days / 30.44))
+
+def build(df: pd.DataFrame) -> pd.DataFrame:
+    flags = build_report_level_flags(df)
+
+    out = df.merge(flags, on=ID_COL, how="left")
+    # raporty, ktorych walidator w ogole nie zobaczyl (np. brak balance_sheet_schema)
+    out["is_valid_sums"] = out["is_valid_sums"].astype("boolean")
+    out["has_forbidden_negative"] = out["has_forbidden_negative"].astype("boolean")
+
+    out["report_period_months"] = out.apply(
+        lambda r: months_between(r[START_COL], r[END_COL]), axis=1
+    )
+    return out
+
+
+if __name__ == "__main__":
+    df_in = pd.read_parquet(INPUT_PATH)
+    df_out = build(df_in)
+
+    out_path = Path(OUTPUT_PATH)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    df_out.to_parquet(out_path, index=False)
+
+    print(f"Zapisano {len(df_out)} wierszy -> {out_path}")
+    print(df_out[["is_valid_sums", "has_forbidden_negative"]].value_counts(dropna=False))
