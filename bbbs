@@ -1,71 +1,38 @@
-"""
-Buduje data/stage/cash_flow_cor.parquet: oryginalna tabela cash_flow +
-flagi walidacyjne per raport, w tym głowna flaga is_valid.
-"""
-from pathlib import Path
-import pandas as pd
-
-from validate_cash_flow import validate_cash_flow, summarize_report_level
-from common import months_between
-
-INPUT_PATH = "data/stage/cash_flow.parquet"
-OUTPUT_PATH = "data/stage/cash_flow_cor.parquet"
-ID_COL = "report_id"
-START_COL = "report_period_start_dte"
-END_COL = "report_period_end_dte"
-
-
-def build_report_level_flags(df: pd.DataFrame, id_col: str = ID_COL) -> pd.DataFrame:
-    long_results = validate_cash_flow(df, id_cols=(id_col,))
+def build_report_level_flags(df: pd.DataFrame, id_cols=ID_COLS) -> pd.DataFrame:
+    # Walidacja przekazuje całą listę kolumn jako klucz
+    long_results = validate_cash_flow(df, id_cols=id_cols)  # odpowiednio: validate_balance_sheet / validate_income_statement
 
     if long_results.empty:
-        return pd.DataFrame({
-            id_col: df[id_col],
-            "is_valid_sums": pd.Series([pd.NA] * len(df), dtype="boolean"),
-            "has_forbidden_negative": pd.Series([pd.NA] * len(df), dtype="boolean"),
-            "bilansowa_zmiana_niespojna": pd.Series([pd.NA] * len(df), dtype="boolean"),
-            "is_valid": pd.Series([pd.NA] * len(df), dtype="boolean"),
-        })
+        empty_df = df[id_cols].copy()
+        for col in ["is_valid_sums", "has_forbidden_negative", "is_valid"]:
+            empty_df[col] = pd.Series([pd.NA] * len(df), dtype="boolean")
+        return empty_df
 
-    summary = summarize_report_level(long_results, id_cols=(id_col,))
+    summary = summarize_report_level(long_results, id_cols=id_cols)
     is_unknown = summary["report_status"] == "unknown_structure"
 
-    # Wyliczanie poszczególnych flag
     is_valid_sums = (summary["n_mismatch"] == 0).astype("boolean").mask(is_unknown, pd.NA)
     has_forbidden_neg = (summary["n_forbidden_negative"] > 0).astype("boolean").mask(is_unknown, pd.NA)
-    bilansowa_niespojna = summary["bilansowa_zmiana_niespojna"].astype("boolean").mask(is_unknown, pd.NA)
-
-    # Główna flaga is_valid (musi zgadzać się suma oraz nie być wartości zakazanych)
     is_valid = is_valid_sums & (~has_forbidden_neg)
 
     summary["is_valid_sums"] = is_valid_sums
     summary["has_forbidden_negative"] = has_forbidden_neg
-    summary["bilansowa_zmiana_niespojna"] = bilansowa_niespojna
     summary["is_valid"] = is_valid
 
-    return summary[[id_col, "is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna", "is_valid"]]
+    # Zwracamy podane kolumny kluczowe oraz wyliczone flagi
+    return summary[id_cols + ["is_valid_sums", "has_forbidden_negative", "is_valid"]]
 
 
 def build(df: pd.DataFrame) -> pd.DataFrame:
-    flags = build_report_level_flags(df)
-    out = df.merge(flags, on=ID_COL, how="left")
+    flags = build_report_level_flags(df, id_cols=ID_COLS)
     
-    for c in ["is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna", "is_valid"]:
+    # Merge po zespole 3 kolumn
+    out = df.merge(flags, on=ID_COLS, how="left")
+    
+    for c in ["is_valid_sums", "has_forbidden_negative", "is_valid"]:
         out[c] = out[c].astype("boolean")
         
     out["report_period_months"] = out.apply(
         lambda r: months_between(r[START_COL], r[END_COL]), axis=1
     )
     return out
-
-
-if __name__ == "__main__":
-    df_in = pd.read_parquet(INPUT_PATH)
-    df_out = build(df_in)
-
-    out_path = Path(OUTPUT_PATH)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    df_out.to_parquet(out_path, index=False)
-
-    print(f"Zapisano {len(df_out)} wierszy -> {out_path}")
-    print(df_out[["is_valid", "is_valid_sums", "has_forbidden_negative", "bilansowa_zmiana_niespojna"]].value_counts(dropna=False))
