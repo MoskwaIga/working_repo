@@ -1,226 +1,34 @@
-"""
-Walidacja równań Bilansu zintegrowana do standardu z walidacją RZiS oraz RPP.
-"""
+"""Wspolne funkcje pomocnicze dla skryptow budujacych tabele *_cor."""
 
-from dataclasses import dataclass #[cite: 8, 9]
-from typing import Optional, List #[cite: 8, 9]
-import pandas as pd #[cite: 7, 8, 9]
-import numpy as np #[cite: 8, 9]
-import re #[cite: 7]
+import calendar
+import pandas as pd
+import numpy as np
 
 
-# ---------------------------------------------------------------------------
-# 1. FUNKCJE POMOCNICZE I REGUŁY BIZNESOWE
-# ---------------------------------------------------------------------------
+def months_between(start, end):
+    """
+    Liczba pelnych miesiecy okresu obrotowego [start, end] (oba konce
+    wlacznie - tak jak raportowane 'report_period_start_dte' /
+    'report_period_end_dte', np. 2021-01-01 -> 2021-12-31 = 12).
 
-def safe_float(val) -> float:
-    """Konwertuje liczby, w tym formaty księgowe '(100)' na -100.0[cite: 7]."""
-    if pd.isna(val): #[cite: 7]
-        return 0.0 #[cite: 7]
-    if isinstance(val, (int, float)): #[cite: 7]
-        return float(val) #[cite: 7]
+    Dziala poprawnie dla typowego przypadku (start = 1. dzien miesiaca,
+    end = ostatni dzien miesiaca -> np. skrocony pierwszy rok dzialalnosci,
+    polrocze, okres po polaczeniu spolek itp.) - wtedy liczy pelne miesiace
+    kalendarzowe. W przeciwnym razie (np. daty "krzywe", nie na granicy
+    miesiaca) liczy w przyblizeniu na podstawie liczby dni (30.44 dnia/mies.,
+    zaokraglone) - takie wiersze warto pozniej przejrzec recznie.
+    """
+    if pd.isna(start) or pd.isna(end):
+        return np.nan
 
-    val_str = str(val).strip() #[cite: 7]
-    if val_str.startswith('(') and val_str.endswith(')'): #[cite: 7]
-        val_str = '-' + val_str[1:-1] #[cite: 7]
+    start = pd.Timestamp(start)
+    end = pd.Timestamp(end)
 
-    try:
-        return float(val_str.replace(' ', '').replace(',', '.')) #[cite: 7]
-    except (ValueError, TypeError): #[cite: 7]
-        return 0.0 #[cite: 7]
+    calendar_months = (end.year - start.year) * 12 + (end.month - start.month)
+    end_is_last_day = end.day == calendar.monthrange(end.year, end.month)[1]
 
+    if start.day == 1 and end_is_last_day:
+        return int(calendar_months + 1)
 
-def is_forbidden_negative(key: str) -> bool:
-    """Sprawdza, czy dana pozycja bilansowa ma bezwzględny zakaz wartości ujemnych[cite: 7]."""
-    base_key = re.sub(r'_(current|previous)$', '', key, flags=re.IGNORECASE) #[cite: 7]
-
-    if base_key.startswith('Aktywa'): #[cite: 7]
-        return True #[cite: 7]
-
-    if base_key in ['Pasywa', 'Pasywa_B', 'Pasywa_A_I'] or base_key.startswith('Pasywa_B_'): #[cite: 7]
-        return True #[cite: 7]
-
-    return False #[cite: 7]
-
-
-# Schematy bilansu, w których dzieci poniżej poziomu 1 (np. Aktywa_B_1, Pasywa_A_1)
-# to pozycje "w tym" - informacyjny PODZBIÓR rodzica, a NIE jego wyczerpujący rozkład[cite: 7].
-NON_EXHAUSTIVE_LEVEL2_SCHEMAS = {
-    'BilansJednostkaMikro', 'SprFinJednostkaMikroWZlotych', 'JednostkaMikro', #[cite: 7]
-}
-
-
-# ---------------------------------------------------------------------------
-# 2. STRUKTURA WYNIKOWA
-# ---------------------------------------------------------------------------
-
-@dataclass
-class EquationCheck: #[cite: 8, 9]
-    period: str #[cite: 8, 9]
-    equation: str #[cite: 8, 9]
-    lhs_col: str #[cite: 8, 9]
-    expected: float #[cite: 8, 9]
-    actual: float #[cite: 8, 9]
-    diff: float #[cite: 8, 9]
-    status: str   # "ok" / "mismatch" / "forbidden_negative" / "missing_data"[cite: 8, 9]
-
-
-# ---------------------------------------------------------------------------
-# 3. ROZPOZNANIE STRUKTURY
-# ---------------------------------------------------------------------------
-
-def resolve_bs_structure(row: pd.Series, schema_col: str = 'balance_sheet_schema') -> str:
-    """Zwraca schemat bilansu (np. 'BilansJednostkaMikro') lub 'unknown'."""
-    schema = row.get(schema_col) #[cite: 7]
-    return str(schema) if pd.notna(schema) else "unknown"
-
-
-# ---------------------------------------------------------------------------
-# 4. WALIDACJA
-# ---------------------------------------------------------------------------
-
-def check_row_balance_sheet(row: pd.Series, schema_col: str = 'balance_sheet_schema',
-                            tolerance_abs: float = 1.0, tolerance_rel: float = 0.0005) -> List[EquationCheck]:
-    
-    schema = resolve_bs_structure(row, schema_col)
-    skip_level2 = schema in NON_EXHAUSTIVE_LEVEL2_SCHEMAS #[cite: 7]
-    results = []
-
-    # Wyciągnięcie wszystkich kolumn bilansowych i konwersja na float[cite: 7]
-    balance_cols = [c for c in row.index if re.match(r'^(Aktywa|Pasywa)_', str(c), re.IGNORECASE)] #[cite: 7]
-    data = {str(col): safe_float(row[col]) for col in balance_cols} #[cite: 7]
-
-    # --- TEST 1: Walidacja wartości ujemnych[cite: 7] ---
-    for col_key, val in data.items(): #[cite: 7]
-        if val < 0 and is_forbidden_negative(col_key): #[cite: 7]
-            period = "current" if col_key.lower().endswith("_current") else "previous" #[cite: 7]
-            results.append(EquationCheck(
-                period=period, equation=f"NoNegative_{col_key}", lhs_col=col_key,
-                expected=0.0, actual=val, diff=val, status="forbidden_negative"
-            ))
-
-    # --- TEST 2: Walidacja sum kontrolnych (Poziomy 0, 1, 2)[cite: 7] ---
-    def _check_sum(parent_key: str, child_keys: list, equation_name: str, period: str):
-        if not child_keys or parent_key not in data: #[cite: 7]
-            return
-
-        parent_val = data.get(parent_key, 0.0) #[cite: 7]
-        children_vals = [data.get(k, 0.0) for k in child_keys] #[cite: 7]
-        expected = sum(children_vals) #[cite: 7]
-
-        all_children_zero = all(v == 0.0 for v in children_vals) #[cite: 7]
-        diff = parent_val - expected #[cite: 8, 9]
-        
-        tol = max(tolerance_abs, tolerance_rel * abs(expected)) #[cite: 8, 9]
-        # Przepuszczamy, jeśli suma różnic mieści się w tolerancji, LUB jeśli 
-        # wszystkie dzieci to zera, ale rodzic nie ma zdefiniowanych węzłów.
-        status = "ok" if (all_children_zero and parent_val == 0.0) or abs(diff) <= tol else "mismatch" #[cite: 8, 9]
-
-        results.append(EquationCheck(
-            period=period, equation=equation_name, lhs_col=parent_key,
-            expected=expected, actual=parent_val, diff=diff, status=status
-        ))
-
-    for period in ["current", "previous"]: #[cite: 7]
-        # Poziom 0: Aktywa == Pasywa[cite: 7]
-        akt_lvl0, pas_lvl0 = f"Aktywa_{period}", f"Pasywa_{period}" #[cite: 7]
-        if akt_lvl0 in data and pas_lvl0 in data: #[cite: 7]
-            _check_sum(akt_lvl0, [pas_lvl0], "Poziom 0: Aktywa == Pasywa", period) #[cite: 7]
-
-        # Poziom 1 i 2[cite: 7]
-        for section in ["Aktywa", "Pasywa"]: #[cite: 7]
-            root = f"{section}_{period}" #[cite: 7]
-            pattern_lvl1 = re.compile(rf"^{section}_([A-Z])_{period}$", re.IGNORECASE) #[cite: 7]
-
-            lvl1_children = [k for k in data.keys() if pattern_lvl1.match(k)] #[cite: 7]
-            lvl1_children.sort(key=lambda x: pattern_lvl1.match(x).group(1)) #[cite: 7]
-
-            if lvl1_children: #[cite: 7]
-                _check_sum(root, lvl1_children, f"Poziom 1: {section}", period) #[cite: 7]
-
-            if skip_level2: #[cite: 7]
-                continue #[cite: 7]
-
-            for parent_lvl1 in lvl1_children: #[cite: 7]
-                match = pattern_lvl1.match(parent_lvl1) #[cite: 7]
-                if not match: #[cite: 7]
-                    continue #[cite: 7]
-                letter = match.group(1) #[cite: 7]
-                
-                # Łapiemy numerację rzymską i arabską[cite: 7]
-                pattern_lvl2 = re.compile(
-                    rf"^{section}_{letter}_([IVXLCDM]+|\d+)_{period}$", re.IGNORECASE #[cite: 7]
-                )
-
-                lvl2_children = [k for k in data.keys() if pattern_lvl2.match(k)] #[cite: 7]
-                if lvl2_children: #[cite: 7]
-                    _check_sum(parent_lvl1, lvl2_children, f"Poziom 2: {section}_{letter}", period) #[cite: 7]
-
-    return results
-
-
-def validate_balance_sheet(df: pd.DataFrame,
-                           id_cols=("krs", "report_id", "period_to"), #[cite: 8, 9]
-                           schema_col: str = "balance_sheet_schema",
-                           tolerance_abs: float = 1.0,
-                           tolerance_rel: float = 0.0005) -> pd.DataFrame:
-    """Zwraca 'długą' tabelę: jeden wiersz na (raport, okres, równanie)."""
-    id_cols = [c for c in id_cols if c in df.columns] #[cite: 8, 9]
-    rows_out = [] #[cite: 8, 9]
-    
-    for _, row in df.iterrows(): #[cite: 8, 9]
-        structure = resolve_bs_structure(row, schema_col)
-        for chk in check_row_balance_sheet(row, schema_col, tolerance_abs, tolerance_rel):
-            rows_out.append({
-                **{c: row[c] for c in id_cols}, #[cite: 8, 9]
-                "bs_structure": structure,
-                "period": chk.period, #[cite: 8, 9]
-                "equation": chk.equation, #[cite: 8, 9]
-                "expected": chk.expected, #[cite: 8, 9]
-                "actual": chk.actual, #[cite: 8, 9]
-                "diff": chk.diff, #[cite: 8, 9]
-                "status": chk.status, #[cite: 8, 9]
-            })
-            
-    return pd.DataFrame(rows_out) #[cite: 8, 9]
-
-
-def summarize_report_level(results: pd.DataFrame,
-                           id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame: #[cite: 8, 9]
-    id_cols = [c for c in id_cols if c in results.columns] #[cite: 8, 9]
-
-    def worst_status(s): #[cite: 8, 9]
-        if (s == "forbidden_negative").any():
-            return "forbidden_negative"
-        if (s == "mismatch").any(): #[cite: 8, 9]
-            return "mismatch" #[cite: 8, 9]
-        if (s == "missing_data").any(): #[cite: 8, 9]
-            return "missing_data" #[cite: 8, 9]
-        if (s == "unknown_structure").any(): #[cite: 8, 9]
-            return "unknown_structure" #[cite: 8, 9]
-        return "ok" #[cite: 8, 9]
-
-    grouped = results.groupby(id_cols).agg(
-        bs_structure=("bs_structure", "first"),
-        n_equations=("equation", "count"), #[cite: 8, 9]
-        n_mismatch=("status", lambda s: (s == "mismatch").sum()), #[cite: 8, 9]
-        n_forbidden_negative=("status", lambda s: (s == "forbidden_negative").sum()),
-        max_abs_diff=("diff", lambda s: s.abs().max()), #[cite: 8, 9]
-        report_status=("status", worst_status), #[cite: 8, 9]
-    ).reset_index() #[cite: 8, 9]
-
-    return grouped
-
-
-def rejection_rate_by_structure(report_level: pd.DataFrame) -> pd.DataFrame: #[cite: 8, 9]
-    return (
-        report_level
-        .groupby("bs_structure")
-        .agg(
-            n_reports=("report_status", "size"), #[cite: 8, 9]
-            n_mismatch=("report_status", lambda s: (s == "mismatch").sum()), #[cite: 8, 9]
-            n_forbidden_negative=("report_status", lambda s: (s == "forbidden_negative").sum()),
-        )
-        .assign(pct_mismatch=lambda d: (d["n_mismatch"] / d["n_reports"] * 100).round(1)) #[cite: 8, 9]
-        .sort_values("n_reports", ascending=False) #[cite: 8, 9]
-    )
+    # fallback dla dat nie lezacych na granicy miesiaca
+    return int(round((end - start).days / 30.44))
