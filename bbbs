@@ -1,5 +1,5 @@
 """
-Walidacja równań RZiS zintegrowana ze ścisłą kontrolą wartości ujemnych.
+Walidacja równań Rachunku Przepływów Pieniężnych (RPP) w ujednoliconym standardzie.
 """
 
 from dataclasses import dataclass
@@ -8,53 +8,27 @@ import pandas as pd
 import numpy as np
 
 
-RZIS_EQUATIONS = {
-    ("mikro", None): [
-        ("F", [(+1, "A"), (-1, "B"), (+1, "C"), (-1, "D"), (-1, "E")]),
-        ("G", [(+1, "F")]),
+RPP_EQUATIONS = {
+    "bezposrednia": [
+        ("A_III", [(+1, "A_I"), (-1, "A_II")]),
+        ("B_III", [(+1, "B_I"), (-1, "B_II")]),
+        ("C_III", [(+1, "C_I"), (-1, "C_II")]),
+        ("D", [(+1, "A_III"), (+1, "B_III"), (+1, "C_III")]),
+        ("G", [(+1, "F"), (+1, "D")]),
     ],
-    ("mala", "porownawczy"): [
-        ("C", [(+1, "A"), (-1, "B")]),
-        ("H", [(+1, "C"), (+1, "D"), (-1, "E"), (+1, "F"), (-1, "G")]),
-        ("J", [(+1, "H"), (-1, "I")]),
-    ],
-    ("mala", "kalkulacyjny"): [
-        ("E", [(+1, "A"), (-1, "B"), (-1, "C"), (-1, "D")]),
-        ("J", [(+1, "E"), (+1, "F"), (-1, "G"), (+1, "H"), (-1, "I")]),
-        ("L", [(+1, "J"), (-1, "K")]),
-    ],
-    ("inna", "porownawczy"): [
-        ("C", [(+1, "A"), (-1, "B")]),
-        ("F", [(+1, "C"), (+1, "D"), (-1, "E")]),
-        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
-        ("L", [(+1, "I"), (-1, "J"), (-1, "K")]),
-    ],
-    ("inna", "kalkulacyjny"): [
-        ("C", [(+1, "A"), (-1, "B")]),
-        ("F", [(+1, "C"), (-1, "D"), (-1, "E")]),
-        ("I", [(+1, "F"), (+1, "G"), (-1, "H")]),
-        ("L", [(+1, "I"), (+1, "J"), (-1, "K")]),
-        ("O", [(+1, "L"), (-1, "M"), (-1, "N")]),
+    "posrednia": [
+        ("A_III", [(+1, "A_I"), (+1, "A_II")]),
+        ("B_III", [(+1, "B_I"), (-1, "B_II")]),
+        ("C_III", [(+1, "C_I"), (-1, "C_II")]),
+        ("D", [(+1, "A_III"), (+1, "B_III"), (+1, "C_III")]),
+        ("G", [(+1, "F"), (+1, "D")]),
     ],
 }
 
-
-def is_forbidden_negative_rzis(letter: str, structure: tuple) -> bool:
-    """
-    Reguła biznesowa RZiS:
-    - Pozycje wyników (LHS w równaniach, np. Zysk/Strata ze sprzedaży, brutto, netto) 
-      MOGĄ być ujemne (zwraca False).
-    - Surowe przychody, koszty i podatek dochodowy NIE MOGĄ być ujemne (zwraca True).
-    """
-    equations = RZIS_EQUATIONS.get(structure, [])
-    lhs_letters = {eq[0] for eq in equations}
-
-    # Jeśli litera jest wynikiem równania -> może być ujemna (strata)
-    if letter in lhs_letters:
-        return False
-
-    # Wszystkie pozostałe pozycje (przychody, koszty, podatek) muszą być >= 0
-    return True
+FORBIDDEN_NEGATIVE_LETTERS = {
+    "bezposrednia": {"A_I", "A_II", "B_I", "B_II", "C_I", "C_II", "F", "G"},
+    "posrednia": {"B_I", "B_II", "C_I", "C_II", "F", "G"},
+}
 
 
 COL_CURRENT = "{letter}_current"
@@ -66,38 +40,19 @@ def _col(letter: str, period: str) -> str:
     return template.format(letter=letter)
 
 
-def _unit_from_schema(income_statement_schema) -> Optional[str]:
-    if pd.isna(income_statement_schema):
+def _method_from_tag(cash_flow_method) -> Optional[str]:
+    if pd.isna(cash_flow_method):
         return None
-    s = str(income_statement_schema).lower()
-    if "mikro" in s:
-        return "mikro"
-    if "mala" in s or "małą" in s or "mała" in s:
-        return "mala"
-    if "inna" in s:
-        return "inna"
+    s = str(cash_flow_method).lower()
+    if "bezp" in s:
+        return "bezposrednia"
+    if "posr" in s or "pośr" in s:
+        return "posrednia"
     return None
 
 
-def _variant_from_tag(income_statement_tag) -> Optional[str]:
-    if pd.isna(income_statement_tag):
-        return None
-    s = str(income_statement_tag).lower()
-    if "por" in s:
-        return "porownawczy"
-    if "kalk" in s:
-        return "kalkulacyjny"
-    return None
-
-
-def resolve_rzis_structure(row: pd.Series) -> Optional[tuple]:
-    unit = _unit_from_schema(row.get("income_statement_schema"))
-    if unit == "mikro":
-        return ("mikro", None)
-    variant = _variant_from_tag(row.get("income_statement_tag"))
-    if unit in ("mala", "inna") and variant in ("porownawczy", "kalkulacyjny"):
-        return (unit, variant)
-    return None
+def resolve_rpp_structure(row: pd.Series) -> Optional[str]:
+    return _method_from_tag(row.get("cash_flow_method"))
 
 
 @dataclass
@@ -108,28 +63,21 @@ class EquationCheck:
     expected: float
     actual: float
     diff: float
-    status: str  # "ok" / "mismatch" / "forbidden_negative" / "missing_data" / "unknown_structure"
+    status: str   # "ok" / "mismatch" / "missing_data" / "warning" / "forbidden_negative" / "unknown_structure"
     has_forbidden_negative: bool = False
 
 
-def check_row_equations(row: pd.Series, tolerance_abs: float = 1.0,
-                         tolerance_rel: float = 0.0005) -> List[EquationCheck]:
-    structure = resolve_rzis_structure(row)
+def check_row_rpp(row: pd.Series, tolerance_abs: float = 1.0,
+                   tolerance_rel: float = 0.0005) -> List[EquationCheck]:
+    structure = resolve_rpp_structure(row)
     if structure is None:
         return [EquationCheck("both", "structure", "-", np.nan, np.nan, np.nan, "unknown_structure")]
 
-    equations = RZIS_EQUATIONS[structure]
-    
-    # Wszystkie litery występujące w danym schemacie
-    all_letters = set()
-    for lhs, components in equations:
-        all_letters.add(lhs)
-        all_letters.update(letter for _, letter in components)
-
+    equations = RPP_EQUATIONS[structure]
     results = []
 
     for period in ("current", "previous"):
-        # 1. Walidacja równań matematycznych
+        # 1. Walidacja równań
         for lhs_letter, components in equations:
             lhs_col = _col(lhs_letter, period)
             lhs_value = row.get(lhs_col, np.nan)
@@ -137,28 +85,46 @@ def check_row_equations(row: pd.Series, tolerance_abs: float = 1.0,
                                  for sign, letter in components]
 
             if pd.isna(lhs_value) or any(pd.isna(v) for _, v in component_values):
-                results.append(EquationCheck(period, lhs_letter, lhs_col,
-                                              np.nan, lhs_value, np.nan, "missing_data"))
+                results.append(EquationCheck(
+                    period=period, equation=lhs_letter, lhs_col=lhs_col,
+                    expected=np.nan, actual=lhs_value, diff=np.nan,
+                    status="missing_data",
+                ))
                 continue
 
             expected = sum(sign * val for sign, val in component_values)
             diff = lhs_value - expected
             tol = max(tolerance_abs, tolerance_rel * abs(expected))
             status = "ok" if abs(diff) <= tol else "mismatch"
-            results.append(EquationCheck(period, lhs_letter, lhs_col, expected, lhs_value, diff, status))
 
-        # 2. Walidacja zakazanych wartości ujemnych
-        for letter in all_letters:
+            results.append(EquationCheck(
+                period=period, equation=lhs_letter, lhs_col=lhs_col,
+                expected=expected, actual=lhs_value, diff=diff, status=status,
+            ))
+
+        # 2. Miękki check: E (bilansowa zmiana) vs D (przepływy netto razem)
+        d_val = row.get(_col("D", period), np.nan)
+        e_val = row.get(_col("E", period), np.nan)
+        if pd.isna(d_val) or pd.isna(e_val):
+            results.append(EquationCheck(period, "E_vs_D", _col("E", period),
+                                          d_val, e_val, np.nan, "missing_data"))
+        else:
+            diff = e_val - d_val
+            tol = max(tolerance_abs, tolerance_rel * abs(d_val))
+            status = "ok" if abs(diff) <= tol else "warning"
+            results.append(EquationCheck(period, "E_vs_D", _col("E", period),
+                                          d_val, e_val, diff, status))
+
+        # 3. Niedozwolone wartości ujemne
+        for letter in FORBIDDEN_NEGATIVE_LETTERS[structure]:
             col = _col(letter, period)
             val = row.get(col, np.nan)
-            
             if pd.isna(val):
                 continue
-                
-            if val < 0 and is_forbidden_negative_rzis(letter, structure):
+            if val < 0:
                 results.append(EquationCheck(
                     period=period, 
-                    equation=f"NoNegative_{letter}", 
+                    equation=f"negative_{letter}", 
                     lhs_col=col,
                     expected=0.0, 
                     actual=val, 
@@ -170,18 +136,18 @@ def check_row_equations(row: pd.Series, tolerance_abs: float = 1.0,
     return results
 
 
-def validate_income_statement(df: pd.DataFrame,
-                               id_cols=("krs", "report_id", "period_to"),
-                               tolerance_abs: float = 1.0,
-                               tolerance_rel: float = 0.0005) -> pd.DataFrame:
+def validate_cash_flow(df: pd.DataFrame,
+                        id_cols=("krs", "report_id", "period_to"),
+                        tolerance_abs: float = 1.0,
+                        tolerance_rel: float = 0.0005) -> pd.DataFrame:
     id_cols = [c for c in id_cols if c in df.columns]
     rows_out = []
     for _, row in df.iterrows():
-        structure = resolve_rzis_structure(row)
-        for chk in check_row_equations(row, tolerance_abs, tolerance_rel):
+        structure = resolve_rpp_structure(row)
+        for chk in check_row_rpp(row, tolerance_abs, tolerance_rel):
             rows_out.append({
                 **{c: row[c] for c in id_cols},
-                "rzis_structure": str(structure) if structure else "unknown",
+                "rpp_structure": structure if structure else "unknown",
                 "period": chk.period,
                 "equation": chk.equation,
                 "expected": chk.expected,
@@ -194,8 +160,9 @@ def validate_income_statement(df: pd.DataFrame,
 
 
 def summarize_report_level(results: pd.DataFrame,
-                           id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame:
+                            id_cols=("krs", "report_id", "period_to")) -> pd.DataFrame:
     id_cols = [c for c in id_cols if c in results.columns]
+    core = results[results["equation"] != "E_vs_D"]
 
     def worst_status(s):
         if (s == "unknown_structure").any():
@@ -208,30 +175,22 @@ def summarize_report_level(results: pd.DataFrame,
             return "missing_data"
         return "ok"
 
-    return results.groupby(id_cols).agg(
-        rzis_structure=("rzis_structure", "first"),
+    grouped = core.groupby(id_cols).agg(
+        rpp_structure=("rpp_structure", "first"),
         n_equations=("equation", "count"),
         n_mismatch=("status", lambda s: (s == "mismatch").sum()),
         n_forbidden_negative=("status", lambda s: (s == "forbidden_negative").sum()),
+        n_missing=("status", lambda s: (s == "missing_data").sum()),
         max_abs_diff=("diff", lambda s: s.abs().max()),
         report_status=("status", worst_status),
     ).reset_index()
------------------
-def build_report_level_flags(df: pd.DataFrame, id_col: str = ID_COL) -> pd.DataFrame:
-    long_results = validate_income_statement(df, id_cols=(id_col,))
 
-    if long_results.empty:
-        return pd.DataFrame({
-            id_col: df[id_col],
-            "is_valid_sums": pd.Series([pd.NA] * len(df), dtype="boolean"),
-            "has_forbidden_negative": pd.Series([pd.NA] * len(df), dtype="boolean")
-        })
+    e_vs_d = (results[results["equation"] == "E_vs_D"]
+              .groupby(id_cols)["status"]
+              .apply(lambda s: (s == "warning").any())
+              .rename("bilansowa_zmiana_niespojna")
+              .reset_index())
 
-    summary = summarize_report_level(long_results, id_cols=(id_col,))
-    is_unknown = summary["report_status"] == "unknown_structure"
-
-    # Jeśli wystąpiła choć jedna zakazana ujemna wartość -> has_forbidden_negative = True (1)
-    summary["is_valid_sums"] = (summary["n_mismatch"] == 0).astype("boolean").mask(is_unknown, pd.NA)
-    summary["has_forbidden_negative"] = (summary["n_forbidden_negative"] > 0).astype("boolean").mask(is_unknown, pd.NA)
-
-    return summary[[id_col, "is_valid_sums", "has_forbidden_negative"]]
+    out = grouped.merge(e_vs_d, on=id_cols, how="left")
+    out["bilansowa_zmiana_niespojna"] = out["bilansowa_zmiana_niespojna"].astype("boolean")
+    return out
